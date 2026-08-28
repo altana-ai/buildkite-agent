@@ -78,6 +78,17 @@ func (e *Executor) fetchSource(ctx context.Context, addBloblessFilter bool, atte
 		}
 	}
 
+	gitFetchFlags := e.GitFetchFlags
+	if addBloblessFilter {
+		gitFetchFlags = "--filter=blob:none " + gitFetchFlags
+	}
+
+	// A job that asked for the base branch wants it whether or not its own commit
+	// still needs fetching, so this precedes the skip below.
+	if e.GitFetchBaseBranch {
+		e.fetchBaseBranch(ctx, gitFetchFlags)
+	}
+
 	// If configured, skip the fetch when the commit already exists locally.
 	// This is useful when a pre-populated git mirror is used with --reference,
 	// as the commit objects are already reachable and fetching is redundant.
@@ -90,11 +101,6 @@ func (e *Executor) fetchSource(ctx context.Context, addBloblessFilter bool, atte
 	if skipFetch {
 		e.shell.Commentf("Commit %q already exists locally, skipping fetch", e.Commit)
 		return nil
-	}
-
-	gitFetchFlags := e.GitFetchFlags
-	if addBloblessFilter {
-		gitFetchFlags = "--filter=blob:none " + gitFetchFlags
 	}
 
 	switch kind {
@@ -613,4 +619,57 @@ func gitFetchWithFallback(ctx context.Context, shell *shell.Shell, gitFetchFlags
 	}
 
 	return nil
+}
+
+// baseBranchToFetch returns the branch a diff in this job would be taken against.
+//
+// The precedence is the one `pipeline upload` already uses for --git-diff-base,
+// minus its final literal "main": guessing a name would mean a failed fetch on
+// every repository whose default branch is called something else.
+func (e *Executor) baseBranchToFetch() string {
+	built := strings.TrimPrefix(e.Branch, "refs/heads/")
+	for _, name := range []string{"BUILDKITE_PULL_REQUEST_BASE_BRANCH", "BUILDKITE_PIPELINE_DEFAULT_BRANCH"} {
+		branch, _ := e.shell.Env.Get(name)
+		branch = strings.TrimPrefix(branch, "refs/heads/")
+		if branch == "" {
+			continue
+		}
+		if branch == built {
+			// The job's own fetch already brought the branch under test.
+			return ""
+		}
+		return branch
+	}
+	return ""
+}
+
+// fetchBaseBranch updates refs/remotes/origin/<base>, which the job's own fetch
+// does not: it asks for refs/pull/N/head and the commit, and checkout directories
+// are reused, so that ref otherwise holds whatever an earlier build left there.
+//
+// It is separate from that fetch because FETCH_HEAD resolves to the first ref
+// fetched and the checkout depends on it. The refspec is explicit and forced so the
+// remote-tracking ref lands whatever remote.origin.fetch says, and follows a
+// force-pushed base branch instead of stopping at a non-fast-forward rejection.
+//
+// Neither fatal nor retried: the checkout is complete without it, and the retry on
+// the job's own fetch waits out asynchronous creation of the ref being built, which
+// a deleted base branch never gets.
+func (e *Executor) fetchBaseBranch(ctx context.Context, gitFetchFlags string) {
+	base := e.baseBranchToFetch()
+	if base == "" {
+		return
+	}
+
+	e.shell.Commentf("Fetch base branch %q", base)
+
+	refspec := fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", base, base)
+	if err := gitFetch(ctx, gitFetchArgs{
+		Shell:         e.shell,
+		GitFetchFlags: gitFetchFlags,
+		Repository:    "origin",
+		RefSpecs:      []string{refspec},
+	}); err != nil {
+		e.shell.Warningf("Couldn't fetch base branch %q, continuing: %v", base, err)
+	}
 }

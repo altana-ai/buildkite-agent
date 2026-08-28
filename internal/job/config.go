@@ -108,6 +108,9 @@ type ExecutorConfig struct {
 	// Controls which sources may override the agent's checkout settings.
 	// Intentionally has no env tag so hooks cannot relax it at runtime.
 	CheckoutOverrideMode env.CheckoutOverrideMode
+	// Whether to fetch the base branch during checkout, so later commands can diff
+	// against its current tip
+	GitFetchBaseBranch bool `env:"BUILDKITE_GIT_FETCH_BASE_BRANCH"`
 
 	// Timeout in seconds for the git checkout phase (0 means no timeout)
 	GitCheckoutTimeout int `env:"BUILDKITE_GIT_CHECKOUT_TIMEOUT"`

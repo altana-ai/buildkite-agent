@@ -179,6 +179,7 @@ type AgentStartConfig struct {
 	SkipCheckout                bool     `cli:"skip-checkout"`
 	GitSkipFetchExistingCommits bool     `cli:"git-skip-fetch-existing-commits"`
 	CheckoutOverrideMode        string   `cli:"checkout-override-mode"`
+	GitFetchBaseBranch          bool     `cli:"git-fetch-base-branch"`
 	CheckoutAttempts            int      `cli:"checkout-attempts"`
 
 	NoSSHKeyscan            bool     `cli:"no-ssh-keyscan"`
@@ -573,6 +574,7 @@ var AgentStartCommand = cli.Command{
 		GitCheckoutTimeoutFlag,
 		GitSubmoduleCloneConfigFlag,
 		GitSkipFetchExistingCommitsFlag,
+		GitFetchBaseBranchFlag,
 		CheckoutAttemptsFlag,
 
 		cli.StringFlag{
@@ -1158,6 +1160,7 @@ var AgentStartCommand = cli.Command{
 			SkipCheckout:                    cfg.SkipCheckout,
 			GitSkipFetchExistingCommits:     cfg.GitSkipFetchExistingCommits,
 			CheckoutOverrideMode:            checkoutMode,
+			GitFetchBaseBranch:              cfg.GitFetchBaseBranch,
 			CheckoutAttempts:                cfg.CheckoutAttempts,
 			SSHKeyscan:                      !cfg.NoSSHKeyscan,
 			CommandEval:                     !cfg.NoCommandEval,
