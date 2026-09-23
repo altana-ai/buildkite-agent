@@ -18,7 +18,9 @@ import (
 	"github.com/buildkite/agent/v3/internal/experiments"
 	"github.com/buildkite/agent/v3/internal/job"
 	"github.com/buildkite/agent/v3/internal/job/hook"
+	"github.com/buildkite/agent/v3/internal/jobcgroup"
 	"github.com/buildkite/agent/v3/internal/process"
+	"github.com/buildkite/agent/v3/internal/ptr"
 	"github.com/buildkite/agent/v3/kubernetes"
 	"github.com/buildkite/agent/v3/logger"
 	"github.com/buildkite/agent/v3/metrics"
@@ -398,6 +400,14 @@ One or more containers connected to the agent, but then stopped communicating wi
 func (r *JobRunner) cleanup(ctx context.Context, wg *sync.WaitGroup, exit core.ProcessExit, ignoreAgentInDispatches *bool) {
 	finishedAt := time.Now()
 
+	mode := r.jobCgroupMode()
+	if mode != jobcgroup.ModeOff {
+		r.reportLeftoverProcesses()
+	}
+	if mode == jobcgroup.ModeEnforce && !r.killLeftovers() {
+		ignoreAgentInDispatches = ptr.To(true)
+	}
+
 	// Flush the job logs. If the process is never started, then logs from prior to the attempt to
 	// start the process will still be buffered. Also, there may still be logs in the buffer that
 	// were left behind because the uploader goroutine exited before it could flush them.
@@ -455,6 +465,12 @@ func (r *JobRunner) cleanup(ctx context.Context, wg *sync.WaitGroup, exit core.P
 	// Once we tell the API we're finished it might assign us new work, so make sure everything else is done first.
 	if err := r.client.FinishJob(ctx, r.conf.Job, finishedAt, exit, r.logStreamer.FailedChunks(), ignoreAgentInDispatches); err != nil {
 		r.agentLogger.Errorf("Couldn't mark job as finished: %v", err)
+	}
+
+	// The worker accepts its next job only after cleanup returns, so even in
+	// report mode the job's processes are gone before another job starts.
+	if mode == jobcgroup.ModeReport {
+		r.killLeftovers()
 	}
 
 	r.agentLogger.Infof("Finished job at %s", r.conf.Job.URL())

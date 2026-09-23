@@ -92,6 +92,12 @@ type Config struct {
 	SignalGracePeriod time.Duration
 	Started           chan struct{}
 	Done              chan struct{}
+
+	// UseCgroupFD starts the process directly inside the cgroup v2 directory
+	// open at CgroupFD, so it has no moment outside it in which to fork. It
+	// is only supported on Linux.
+	UseCgroupFD bool
+	CgroupFD    int
 }
 
 // Process is an operating system level process
@@ -207,6 +213,11 @@ func (p *Process) setup(ctx context.Context) error {
 
 	// Setup the process to create a process group if supported
 	p.setupProcessGroup()
+	if p.conf.UseCgroupFD {
+		if err := p.setupCgroup(); err != nil {
+			return err
+		}
+	}
 
 	// Configure working dir and fail if it doesn't exist, otherwise
 	// we get confusing errors about fork/exec failing because the file

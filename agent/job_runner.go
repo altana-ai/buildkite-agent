@@ -20,6 +20,7 @@ import (
 	"github.com/buildkite/agent/v3/core"
 	envutil "github.com/buildkite/agent/v3/env"
 	"github.com/buildkite/agent/v3/internal/experiments"
+	"github.com/buildkite/agent/v3/internal/jobcgroup"
 	"github.com/buildkite/agent/v3/internal/process"
 	"github.com/buildkite/agent/v3/internal/shell"
 	"github.com/buildkite/agent/v3/kubernetes"
@@ -144,6 +145,9 @@ type JobRunner struct {
 	// cancelled because of a Buildkite job-level timeout. The path is passed
 	// to the bootstrap subprocess via BUILDKITE_AGENT_JOB_TIMEOUT_FILE.
 	jobTimeoutFilePath string
+
+	// jobCgroup is the job's cgroup, or nil if the job runs outside one.
+	jobCgroup *jobcgroup.Group
 }
 
 // jobProcess is either a *process.Process, or a *kubernetes.Runner.
@@ -363,7 +367,7 @@ func NewJobRunner(ctx context.Context, l logger.Logger, apiClient *api.Client, c
 			cancelSignal = process.SIGTERM
 		}
 
-		r.process = process.New(r.agentLogger, process.Config{
+		procConf := process.Config{
 			Path:              cmd[0],
 			Args:              cmd[1:],
 			Dir:               conf.AgentConfiguration.BuildPath,
@@ -373,7 +377,18 @@ func NewJobRunner(ctx context.Context, l logger.Logger, apiClient *api.Client, c
 			Stderr:            r.jobLogs,
 			InterruptSignal:   cancelSignal,
 			SignalGracePeriod: conf.AgentConfiguration.SignalGracePeriod,
-		})
+		}
+		if m := conf.AgentConfiguration.JobCgroup; m != nil {
+			g, err := m.Create(conf.Job.ID)
+			if err != nil {
+				r.agentLogger.Warnf("[JobRunner] Job %s will run outside a job cgroup: %v", conf.Job.ID, err)
+			} else {
+				r.jobCgroup = g
+				procConf.UseCgroupFD = true
+				procConf.CgroupFD = g.FD()
+			}
+		}
+		r.process = process.New(r.agentLogger, procConf)
 	}
 
 	// Close the writer end of the pipe when the process finishes

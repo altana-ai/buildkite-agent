@@ -34,6 +34,7 @@ import (
 	gcpsigner "github.com/buildkite/agent/v3/internal/cryptosigner/gcp"
 	"github.com/buildkite/agent/v3/internal/experiments"
 	"github.com/buildkite/agent/v3/internal/job/hook"
+	"github.com/buildkite/agent/v3/internal/jobcgroup"
 	"github.com/buildkite/agent/v3/internal/osutil"
 	"github.com/buildkite/agent/v3/internal/process"
 	"github.com/buildkite/agent/v3/internal/shell"
@@ -121,6 +122,7 @@ type AgentStartConfig struct {
 	CancelGracePeriod          int    `cli:"cancel-grace-period"`
 	SignalGracePeriodSeconds   int    `cli:"signal-grace-period-seconds"`
 	ReflectExitStatus          bool   `cli:"reflect-exit-status"`
+	JobCgroup                  string `cli:"job-cgroup"`
 
 	EnableJobLogTmpfile bool   `cli:"enable-job-log-tmpfile"`
 	JobLogPath          string `cli:"job-log-path" normalize:"filepath"`
@@ -425,6 +427,12 @@ var AgentStartCommand = cli.Command{
 			EnvVar: "BUILDKITE_AGENT_DISCONNECT_AFTER_UPTIME",
 		},
 		cancelGracePeriodFlag,
+		cli.StringFlag{
+			Name:   "job-cgroup",
+			Value:  "off",
+			Usage:  "Run each job in its own cgroup v2 group and kill whatever it leaves running before the next job, even processes that left the job's process group. One of ′off′, ′report′ (kill after the job's result is reported) or ′enforce′ (kill before the job is marked finished, and stop accepting jobs if any process survives). Linux only, and the agent's own cgroup must be delegated to it, for example with systemd ′Delegate=pids′",
+			EnvVar: "BUILDKITE_JOB_CGROUP",
+		},
 		cli.BoolFlag{
 			Name:   "enable-job-log-tmpfile",
 			Usage:  "Store the job logs in a temporary file ′BUILDKITE_JOB_LOG_TMPFILE′ that is accessible during the job and removed at the end of the job (default: false)",
@@ -993,6 +1001,11 @@ var AgentStartCommand = cli.Command{
 			return fmt.Errorf("while parsing trace context encoding: %v", err)
 		}
 
+		jobCgroupMode, err := jobcgroup.ParseMode(cfg.JobCgroup)
+		if err != nil {
+			return err
+		}
+
 		mc := metrics.NewCollector(l, metrics.CollectorConfig{
 			Datadog:              cfg.MetricsDatadog,
 			DatadogHost:          cfg.MetricsDatadogHost,
@@ -1219,6 +1232,18 @@ var AgentStartCommand = cli.Command{
 
 		if agentConf.DisconnectAfterJob {
 			l.Infof("Agents will disconnect after a job run has completed")
+		}
+
+		if jobCgroupMode != jobcgroup.ModeOff && cfg.KubernetesExec {
+			l.Warnf("job-cgroup=%s has no effect with kubernetes-exec, which runs jobs in other containers", jobCgroupMode)
+		} else if agentConf.JobCgroup = jobcgroup.Setup(l, jobCgroupMode); agentConf.JobCgroup != nil {
+			// The stack's unit may use KillMode=process, in which case
+			// systemd leaves job groups running after the agent exits.
+			defer func() {
+				if err := agentConf.JobCgroup.KillAll(); err != nil {
+					l.Errorf("Couldn't kill every job cgroup on exit: %v", err)
+				}
+			}()
 		}
 
 		if agentConf.DisconnectAfterIdleTimeout > 0 {
