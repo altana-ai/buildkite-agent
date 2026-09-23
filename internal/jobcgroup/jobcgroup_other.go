@@ -20,7 +20,7 @@ func Setup(l logger.Logger, mode Mode) *Manager {
 	return nil
 }
 
-func (m *Manager) KillAll() error                { return errUnsupported }
+func (m *Manager) KillAll(time.Duration) error   { return errUnsupported }
 func (m *Manager) Create(string) (*Group, error) { return nil, errUnsupported }
 func (g *Group) FD() int                         { return -1 }
 func (g *Group) Close() error                    { return nil }

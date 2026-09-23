@@ -22,19 +22,27 @@ import (
 
 const cgroupFS = "/sys/fs/cgroup"
 
-// agentGroupName is the leaf the agent moves itself into. cgroup v2 forbids a
-// group that has processes of its own from enabling controllers for its
-// children, so the agent must leave its unit's group for that group to be
-// able to limit jobs later.
+// ownerGroupPrefix names the subtree each agent process creates in its own
+// cgroup, suffixed with its pid. Several agents can start in one unit or
+// scope, so each must find its own job groups apart from the others'.
+const ownerGroupPrefix = "agent-"
+
+// agentGroupName is the leaf the agent moves itself into, inside its
+// subtree. cgroup v2 forbids a group that has processes of its own from
+// enabling controllers for its children, so the agent must leave the groups
+// above its jobs for those groups to be able to limit jobs later.
 const agentGroupName = "agent"
 
 const jobGroupPrefix = "job-"
 
 // Setup prepares the agent's own cgroup for job groups: it moves the agent
-// into a leaf group, kills any job groups left by a previous agent process,
-// and checks that a process can be started directly into a new group. It
+// into a subtree of its own, checks that a process can be started directly
+// into a new group, and kills the job groups of agents that have exited. It
 // returns nil when mode is off, and also, after logging one warning, when the
 // host cannot support job groups.
+//
+// In enforce mode, the returned Manager is already tainted if an exited
+// agent's processes survive being killed.
 func Setup(l logger.Logger, mode Mode) *Manager {
 	if mode == ModeOff {
 		return nil
@@ -45,47 +53,51 @@ func Setup(l logger.Logger, mode Mode) *Manager {
 		return nil
 	}
 	l.Infof("Each job will run in its own cgroup under %s (job-cgroup=%s)", m.root, mode)
+
+	// A unit with KillMode=process leaves a stopped agent's job groups
+	// running, so a restarted agent must not assume its cgroup is clean.
+	if err := m.killExited(filepath.Dir(m.root), DrainTimeout); err != nil {
+		l.Errorf("Couldn't kill every job cgroup left by an agent that has exited: %v", err)
+	}
 	return m
 }
 
 func setup(mode Mode) (*Manager, error) {
-	own, err := ownCgroup()
+	own, err := cgroupOf("self")
 	if err != nil {
 		return nil, err
 	}
-	root := filepath.Join(cgroupFS, own)
+	parent := filepath.Join(cgroupFS, own)
 
 	// cgroup.kill arrived in Linux 5.14. Without it, killing a group means
 	// racing its forks with per-process signals.
-	if _, err := os.Stat(filepath.Join(root, "cgroup.kill")); err != nil {
+	if _, err := os.Stat(filepath.Join(parent, "cgroup.kill")); err != nil {
 		return nil, fmt.Errorf("cgroup v2 with cgroup.kill (Linux 5.14 or later) is required: %w", err)
 	}
 
+	pid := os.Getpid()
+	root := filepath.Join(parent, ownerGroupPrefix+strconv.Itoa(pid))
 	agentGroup := filepath.Join(root, agentGroupName)
-	if err := os.Mkdir(agentGroup, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
-		return nil, fmt.Errorf("creating %s, so the agent's cgroup is probably not delegated to it (systemd Delegate=yes): %w", agentGroup, err)
+	for _, dir := range []string{root, agentGroup} {
+		if err := os.Mkdir(dir, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+			return nil, fmt.Errorf("creating %s, so the agent's cgroup is probably not delegated to it (systemd Delegate=pids): %w", dir, err)
+		}
 	}
-	if err := writeFile(filepath.Join(agentGroup, "cgroup.procs"), strconv.Itoa(os.Getpid())); err != nil {
+	if err := writeFile(filepath.Join(agentGroup, "cgroup.procs"), strconv.Itoa(pid)); err != nil {
 		return nil, fmt.Errorf("moving the agent into %s: %w", agentGroup, err)
 	}
 
 	m := NewManager(mode, root)
-
-	// A unit with KillMode=process leaves a stopped agent's job groups
-	// running, so a restarted agent must not assume its subtree is empty.
-	if err := m.KillAll(); err != nil {
-		return nil, fmt.Errorf("killing job groups left by a previous agent: %w", err)
-	}
-
 	if err := m.probe(); err != nil {
 		return nil, fmt.Errorf("starting a process directly into a new cgroup: %w", err)
 	}
 	return m, nil
 }
 
-// ownCgroup returns this process's cgroup v2 path, relative to cgroupFS.
-func ownCgroup() (string, error) {
-	data, err := os.ReadFile("/proc/self/cgroup")
+// cgroupOf returns a process's cgroup v2 path, relative to cgroupFS. pid is a
+// number, or "self".
+func cgroupOf(pid string) (string, error) {
+	data, err := os.ReadFile(filepath.Join("/proc", pid, "cgroup"))
 	if err != nil {
 		return "", err
 	}
@@ -117,27 +129,74 @@ func (m *Manager) probe() error {
 	return g.Kill(DrainTimeout)
 }
 
-// KillAll kills and removes every job group under the manager's root. The
-// agent calls it at start-up and again as it exits.
-func (m *Manager) KillAll() error {
+// KillAll kills and removes every job group this agent process has created,
+// waiting up to timeout for each to empty. Other agents' groups are left
+// alone. The agent calls it as it exits.
+func (m *Manager) KillAll(timeout time.Duration) error {
 	entries, err := os.ReadDir(m.root)
 	if err != nil {
 		return err
 	}
 	var errs []error
 	for _, e := range entries {
-		if !e.IsDir() || e.Name() == agentGroupName {
-			continue
-		}
-		if !strings.HasPrefix(e.Name(), jobGroupPrefix) && e.Name() != "probe" {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), jobGroupPrefix) && e.Name() != "probe" {
 			continue
 		}
 		g := &Group{path: filepath.Join(m.root, e.Name())}
-		if err := g.Kill(DrainTimeout); err != nil {
+		if err := g.Kill(timeout); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", g.path, err))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// killExited kills and removes the subtree of every agent under parent whose
+// process has exited, other than m's own. A subtree whose processes survive
+// is kept, and in enforce mode taints m, because a job's processes have
+// survived SIGKILL on this host just as if one of m's own jobs had left them.
+func (m *Manager) killExited(parent string, timeout time.Duration) error {
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, e := range entries {
+		path := filepath.Join(parent, e.Name())
+		pid, ok := ownerPID(e)
+		if !ok || path == m.root || ownerRunning(parent, pid) {
+			continue
+		}
+		g := &Group{path: path}
+		if err := g.Kill(timeout); err != nil {
+			if errors.Is(err, ErrNotEmpty) && m.mode == ModeEnforce {
+				m.Taint()
+			}
+			errs = append(errs, fmt.Errorf("%s: %w", path, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// ownerPID returns the pid of the agent that created the subtree e.
+func ownerPID(e fs.DirEntry) (int, bool) {
+	suffix, ok := strings.CutPrefix(e.Name(), ownerGroupPrefix)
+	if !e.IsDir() || !ok {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(suffix)
+	return pid, err == nil && pid > 0
+}
+
+// ownerRunning reports whether the agent with pid is still running, which it
+// is only while its process is in parent, about to move, or in its own
+// subtree's agent group. A later process that reuses the pid is elsewhere.
+func ownerRunning(parent string, pid int) bool {
+	own, err := cgroupOf(strconv.Itoa(pid))
+	if err != nil {
+		return false
+	}
+	path := filepath.Join(cgroupFS, own)
+	return path == parent || path == filepath.Join(parent, ownerGroupPrefix+strconv.Itoa(pid), agentGroupName)
 }
 
 // Create creates the group for a job and opens it, ready to be passed to
@@ -192,24 +251,31 @@ func (g *Group) Processes() ([]Process, error) {
 			if err != nil {
 				continue
 			}
-			procs = append(procs, Process{PID: pid, Command: commandLine(pid)})
+			name, ppid := stat(pid)
+			procs = append(procs, Process{PID: pid, PPID: ppid, Name: name})
 		}
 		return nil
 	})
 	return procs, err
 }
 
-// commandLine returns a process's argv joined by spaces, or its bracketed
-// name when argv is unavailable, as ps does.
-func commandLine(pid int) string {
-	proc := filepath.Join("/proc", strconv.Itoa(pid))
-	if cmdline, err := os.ReadFile(filepath.Join(proc, "cmdline")); err == nil && len(cmdline) > 0 {
-		return string(bytes.TrimRight(bytes.ReplaceAll(cmdline, []byte{0}, []byte{' '}), " "))
+// stat returns a process's name and its parent's pid from /proc/<pid>/stat,
+// or "?" and 0 if the process has already gone.
+func stat(pid int) (name string, ppid int) {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return "?", 0
 	}
-	if comm, err := os.ReadFile(filepath.Join(proc, "comm")); err == nil {
-		return "[" + strings.TrimSpace(string(comm)) + "]"
+	// The name is parenthesised and can itself contain ")", so it ends at
+	// the last one. The state and then the parent's pid follow it.
+	start, end := bytes.IndexByte(data, '('), bytes.LastIndexByte(data, ')')
+	if start < 0 || end < start {
+		return "?", 0
 	}
-	return "?"
+	if fields := strings.Fields(string(data[end+1:])); len(fields) >= 2 {
+		ppid, _ = strconv.Atoi(fields[1])
+	}
+	return string(data[start+1 : end]), ppid
 }
 
 // Kill sends SIGKILL to every process in the group and its descendant groups,

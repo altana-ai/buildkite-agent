@@ -75,6 +75,10 @@ func (e *missingKeyError) Error() string {
 
 // Run runs the job.
 func (r *JobRunner) Run(ctx context.Context, ignoreAgentInDispatches *bool) (err error) {
+	// cleanup releases the job's cgroup at the point its mode requires. This
+	// covers the returns that come before cleanup is deferred.
+	defer r.releaseJobCgroup()
+
 	if r.cancelled.Load() {
 		return errors.New("job already cancelled before running")
 	}

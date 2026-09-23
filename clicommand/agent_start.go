@@ -1239,11 +1239,16 @@ var AgentStartCommand = cli.Command{
 		} else if agentConf.JobCgroup = jobcgroup.Setup(l, jobCgroupMode); agentConf.JobCgroup != nil {
 			// The stack's unit may use KillMode=process, in which case
 			// systemd leaves job groups running after the agent exits.
-			defer func() {
-				if err := agentConf.JobCgroup.KillAll(); err != nil {
-					l.Errorf("Couldn't kill every job cgroup on exit: %v", err)
-				}
-			}()
+			defer killJobCgroups(l, agentConf.JobCgroup, jobcgroup.DrainTimeout)
+
+			select {
+			case <-agentConf.JobCgroup.Tainted():
+				// Exiting 0 before registering stops systemd restarting
+				// the agent onto a host that is about to be replaced.
+				l.Errorf("Not starting, because processes left by an earlier agent's job survived SIGKILL (job-cgroup=enforce)")
+				return nil
+			default:
+			}
 		}
 
 		if agentConf.DisconnectAfterIdleTimeout > 0 {
@@ -1437,6 +1442,11 @@ var AgentStartCommand = cli.Command{
 			// Under Kubernetes, there is no user interactively signalling us,
 			// so on SIGTERM, stop un-gracefully.
 			skipGraceful: cfg.KubernetesExec,
+			exit:         os.Exit,
+		}
+		if m := agentConf.JobCgroup; m != nil {
+			// os.Exit skips the deferred kill above.
+			poolSigs.beforeExit = func() { killJobCgroups(l, m, hardExitDrainTimeout) }
 		}
 		signals := poolSigs.handle(ctx)
 		defer close(signals)
@@ -1516,6 +1526,30 @@ type poolSignals struct {
 	pool              *agent.AgentPool
 	cancelGracePeriod time.Duration
 	skipGraceful      bool
+
+	// beforeExit, if set, runs just before the agent exits without
+	// returning from its command.
+	beforeExit func()
+	exit       func(code int)
+}
+
+func (ps *poolSignals) exitNow() {
+	if ps.beforeExit != nil {
+		ps.beforeExit()
+	}
+	ps.exit(1)
+}
+
+// hardExitDrainTimeout bounds how long an agent exiting immediately waits for
+// its job groups to empty. SIGKILL has already been sent to every process in
+// them by the time it starts waiting.
+const hardExitDrainTimeout = time.Second
+
+// killJobCgroups kills every job group the agent has created, as it exits.
+func killJobCgroups(l logger.Logger, m *jobcgroup.Manager, timeout time.Duration) {
+	if err := m.KillAll(timeout); err != nil {
+		l.Errorf("Couldn't kill every job cgroup on exit: %v", err)
+	}
 }
 
 func (ps *poolSignals) handle(ctx context.Context) chan os.Signal {
@@ -1554,7 +1588,7 @@ func (ps *poolSignals) handleLoop(ctx context.Context, signals chan os.Signal) {
 			time.Sleep(ps.cancelGracePeriod + 1*time.Second)
 			// We get here if the main goroutine hasn't returned yet.
 			ps.log.Infof("Timed out waiting for agents to exit; exiting immediately with status 1")
-			os.Exit(1)
+			ps.exitNow()
 		}()
 	}
 
@@ -1582,7 +1616,7 @@ func (ps *poolSignals) handleLoop(ctx context.Context, signals chan os.Signal) {
 
 			case 3:
 				ps.log.Infof("Exiting immediately with status 1")
-				os.Exit(1)
+				ps.exitNow()
 			}
 
 		default:

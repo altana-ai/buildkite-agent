@@ -3,8 +3,10 @@
 package jobcgroup
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/buildkite/agent/v3/logger"
 )
 
 // testManager returns a Manager rooted in a fresh group under the test's own
@@ -22,7 +26,7 @@ import (
 func testManager(t *testing.T, mode Mode) *Manager {
 	t.Helper()
 
-	own, err := ownCgroup()
+	own, err := cgroupOf("self")
 	if err != nil {
 		t.Skipf("no cgroup v2: %v", err)
 	}
@@ -37,7 +41,7 @@ func testManager(t *testing.T, mode Mode) *Manager {
 
 	m := NewManager(mode, root)
 	t.Cleanup(func() {
-		if err := m.KillAll(); err != nil {
+		if err := m.KillAll(DrainTimeout); err != nil {
 			t.Errorf("KillAll() error = %v", err)
 		}
 		if err := removeTree(root); err != nil {
@@ -59,46 +63,53 @@ func startInGroup(t *testing.T, g *Group, script string) {
 	}
 }
 
-// awaitCommands waits for the group to hold exactly the given commands, since
-// setsid and nohup exec their argument only after sh has returned.
-func awaitCommands(t *testing.T, g *Group, want ...string) []Process {
+// awaitNames waits for the group to hold processes with exactly the given
+// names, since setsid and nohup exec their argument only after sh has
+// returned.
+func awaitNames(t *testing.T, g *Group, want ...string) []Process {
 	t.Helper()
 
 	slices.Sort(want)
-	var commands []string
+	var names []string
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		procs, err := g.Processes()
 		if err != nil {
 			t.Fatalf("Processes() error = %v", err)
 		}
-		commands = commands[:0]
+		names = names[:0]
 		for _, p := range procs {
-			commands = append(commands, p.Command)
+			names = append(names, p.Name)
 		}
-		slices.Sort(commands)
-		if slices.Equal(commands, want) {
+		slices.Sort(names)
+		if slices.Equal(names, want) {
 			return procs
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("Processes() commands = %q, want %q", commands, want)
+	t.Fatalf("Processes() names = %q, want %q", names, want)
 	return nil
 }
 
-// awaitDead fails the test unless pid exits within a few seconds. A zombie
-// counts as dead: it runs nothing and holds no files.
+// alive reports whether pid is running. A zombie is not: it runs nothing and
+// holds no files.
+func alive(pid int) bool {
+	stat, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return false
+	}
+	// The state follows the parenthesised command name.
+	i := strings.LastIndexByte(string(stat), ')')
+	return i < 0 || !strings.HasPrefix(string(stat[i+1:]), " Z")
+}
+
+// awaitDead fails the test unless pid exits within a few seconds.
 func awaitDead(t *testing.T, pid int) {
 	t.Helper()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		stat, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
-		if errors.Is(err, os.ErrNotExist) {
-			return
-		}
-		// The state follows the parenthesised command name.
-		if i := strings.LastIndexByte(string(stat), ')'); i >= 0 && strings.HasPrefix(string(stat[i+1:]), " Z") {
+		if !alive(pid) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -123,7 +134,7 @@ func TestKillRemovesEscapedProcesses(t *testing.T) {
 		( sleep 302 & ) >/dev/null 2>&1
 	`)
 
-	procs := awaitCommands(t, g, "sleep 301", "sleep 302")
+	procs := awaitNames(t, g, "sleep", "sleep")
 
 	if err := g.Kill(DrainTimeout); err != nil {
 		t.Fatalf("Kill() error = %v", err)
@@ -153,13 +164,41 @@ func TestKillIncludesDescendantGroups(t *testing.T) {
 	defer child.Close() //nolint:errcheck // Test cleanup.
 	startInGroup(t, child, `setsid nohup sleep 303 >/dev/null 2>&1 &`)
 
-	procs := awaitCommands(t, g, "sleep 303")
+	procs := awaitNames(t, g, "sleep")
 	if err := g.Kill(DrainTimeout); err != nil {
 		t.Fatalf("Kill() error = %v", err)
 	}
 	awaitDead(t, procs[0].PID)
 	if _, err := os.Stat(g.Path()); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("os.Stat(%q) error = %v, want the group and its child removed", g.Path(), err)
+	}
+}
+
+func TestProcessesReportsNamesAndParentsButNotArguments(t *testing.T) {
+	t.Parallel()
+
+	m := testManager(t, ModeReport)
+	g, err := m.Create("secretive")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	defer g.Close() //nolint:errcheck // Test cleanup.
+
+	// A hook can export a secret the agent never sees, and pass it on the
+	// command line of a process the job leaves behind.
+	const secret = "s3cret-from-a-hook"
+	startInGroup(t, g, `setsid nohup sh -c 'sleep 308' leaky --token=`+secret+` >/dev/null 2>&1 &`)
+
+	procs := awaitNames(t, g, "sh", "sleep")
+	if got := fmt.Sprintf("%+v", procs); strings.Contains(got, secret) {
+		t.Errorf("Processes() = %s, want no arguments in it", got)
+	}
+	byName := make(map[string]Process)
+	for _, p := range procs {
+		byName[p.Name] = p
+	}
+	if got, want := byName["sleep"].PPID, byName["sh"].PID; got != want {
+		t.Errorf("sleep's PPID = %d, want sh's PID %d", got, want)
 	}
 }
 
@@ -174,12 +213,12 @@ func TestKillAllKillsEveryJobGroup(t *testing.T) {
 			t.Fatalf("Create(%q) error = %v", id, err)
 		}
 		startInGroup(t, g, `setsid nohup sleep 304 >/dev/null 2>&1 &`)
-		procs := awaitCommands(t, g, "sleep 304")
+		procs := awaitNames(t, g, "sleep")
 		pids = append(pids, procs[0].PID)
 		g.Close() //nolint:errcheck // Test cleanup.
 	}
 
-	if err := m.KillAll(); err != nil {
+	if err := m.KillAll(DrainTimeout); err != nil {
 		t.Fatalf("KillAll() error = %v", err)
 	}
 	for _, pid := range pids {
@@ -196,12 +235,14 @@ func TestKillAllKillsEveryJobGroup(t *testing.T) {
 	}
 }
 
-func TestKillReportsGroupThatDoesNotEmpty(t *testing.T) {
-	t.Parallel()
+// fakeStuckGroup makes a plain directory that stands in for a group whose
+// process ignores SIGKILL, which no real process can be made to do on demand.
+func fakeStuckGroup(t *testing.T, dir string) {
+	t.Helper()
 
-	// A plain directory stands in for a group whose process ignores
-	// SIGKILL, which no real process can be made to do on demand.
-	dir := t.TempDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(%q) error = %v", dir, err)
+	}
 	for name, content := range map[string]string{
 		"cgroup.kill":   "",
 		"cgroup.events": "populated 1\nfrozen 0\n",
@@ -210,6 +251,13 @@ func TestKillReportsGroupThatDoesNotEmpty(t *testing.T) {
 			t.Fatalf("os.WriteFile(%q) error = %v", name, err)
 		}
 	}
+}
+
+func TestKillReportsGroupThatDoesNotEmpty(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	fakeStuckGroup(t, dir)
 
 	g := &Group{path: dir}
 	if err := g.Kill(50 * time.Millisecond); !errors.Is(err, ErrNotEmpty) {
@@ -217,6 +265,38 @@ func TestKillReportsGroupThatDoesNotEmpty(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); err != nil {
 		t.Errorf("os.Stat(%q) error = %v, want the group kept for a later retry", dir, err)
+	}
+}
+
+// exitedAgentPID is above the kernel's largest pid, so no agent with it can
+// be running.
+const exitedAgentPID = 99999999
+
+func TestKillExitedTaintsEnforceWhenAnExitedAgentsGroupDoesNotEmpty(t *testing.T) {
+	t.Parallel()
+
+	for mode, wantTainted := range map[Mode]bool{ModeEnforce: true, ModeReport: false} {
+		t.Run(string(mode), func(t *testing.T) {
+			t.Parallel()
+
+			parent := t.TempDir()
+			m := NewManager(mode, filepath.Join(parent, ownerGroupPrefix+strconv.Itoa(os.Getpid())))
+			fakeStuckGroup(t, filepath.Join(parent, ownerGroupPrefix+strconv.Itoa(exitedAgentPID)))
+
+			if err := m.killExited(parent, 50*time.Millisecond); !errors.Is(err, ErrNotEmpty) {
+				t.Errorf("killExited() error = %v, want %v", err, ErrNotEmpty)
+			}
+			select {
+			case <-m.Tainted():
+				if !wantTainted {
+					t.Error("the manager is tainted, want it untainted in report mode")
+				}
+			default:
+				if wantTainted {
+					t.Error("the manager is not tainted, want it tainted in enforce mode")
+				}
+			}
+		})
 	}
 }
 
@@ -231,57 +311,176 @@ func TestCreateRejectsPathLikeJobIDs(t *testing.T) {
 	}
 }
 
-const setupHelperEnv = "JOBCGROUP_TEST_SETUP_HELPER"
+// helperEnv makes the test binary act as an agent process instead of running
+// tests, because Setup moves the process that calls it. Its value is the part
+// to play:
+//   - "setup" calls Setup, prints the result, then kills its job groups as
+//     the agent does when it exits.
+//   - "running-job" calls Setup, leaves one job's process running, prints
+//     "ready", and then waits for its stdin to close.
+const helperEnv = "JOBCGROUP_TEST_HELPER"
 
-// TestSetup runs setup in a copy of the test binary started inside a group of
-// its own, because setup moves the calling process.
-func TestSetup(t *testing.T) {
-	if os.Getenv(setupHelperEnv) != "" {
-		m, err := setup(ModeEnforce)
-		if err != nil {
-			fmt.Println("setup error:", err)
+func init() {
+	role := os.Getenv(helperEnv)
+	if role == "" {
+		return
+	}
+	// Setup's probe runs this binary again, which must not play a part too.
+	os.Unsetenv(helperEnv) //nolint:errcheck // It cannot fail for a valid name.
+
+	switch role {
+	case "setup":
+		m := Setup(logger.Discard, ModeEnforce)
+		if m == nil {
+			fmt.Println("Setup returned nil")
 			os.Exit(1)
 		}
-		own, err := ownCgroup()
+		own, err := cgroupOf("self")
 		fmt.Printf("root=%s\nown=%s %v\n", m.Root(), filepath.Join(cgroupFS, own), err)
-		os.Exit(0)
-	}
-	t.Parallel()
+		if err := m.KillAll(DrainTimeout); err != nil {
+			fmt.Println("KillAll error:", err)
+			os.Exit(1)
+		}
 
-	m := testManager(t, ModeEnforce)
-	unit, err := m.create("job-unit")
-	if err != nil {
-		t.Fatalf("create(unit) error = %v", err)
+	case "running-job":
+		m := Setup(logger.Discard, ModeEnforce)
+		if m == nil {
+			fmt.Println("Setup returned nil")
+			os.Exit(1)
+		}
+		g, err := m.Create("running")
+		if err != nil {
+			fmt.Println("Create error:", err)
+			os.Exit(1)
+		}
+		cmd := exec.Command("/bin/sh", "-c", `setsid nohup sleep 306 >/dev/null 2>&1 &`)
+		cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: g.FD()}
+		if err := cmd.Run(); err != nil {
+			fmt.Println("starting the job error:", err)
+			os.Exit(1)
+		}
+		fmt.Println("ready")
+		_, _ = io.Copy(io.Discard, os.Stdin)
 	}
-	defer unit.Close() //nolint:errcheck // Test cleanup.
+	os.Exit(0)
+}
 
-	stale, err := m.create("job-unit/job-stale")
-	if err != nil {
-		t.Fatalf("create(stale) error = %v", err)
-	}
-	startInGroup(t, stale, `setsid nohup sleep 305 >/dev/null 2>&1 &`)
-	stalePID := awaitCommands(t, stale, "sleep 305")[0].PID
-	stale.Close() //nolint:errcheck // Test cleanup.
-
-	cmd := exec.Command(os.Args[0], "-test.run=^TestSetup$")
-	cmd.Env = append(os.Environ(), setupHelperEnv+"=1")
+// helper returns an agent process in the part named by role, started inside
+// unit.
+func helper(unit *Group, role string) *exec.Cmd {
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(), helperEnv+"="+role)
 	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: unit.FD()}
+	return cmd
+}
+
+// runSetup runs Setup in a new agent process inside unit, and returns what it
+// printed and its pid.
+func runSetup(t *testing.T, unit *Group) (string, int) {
+	t.Helper()
+
+	cmd := helper(unit, "setup")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("setup helper error = %v, output: %s", err, out)
 	}
+	return string(out), cmd.Process.Pid
+}
 
-	wantAgent := filepath.Join(unit.Path(), agentGroupName)
-	for _, want := range []string{"root=" + unit.Path() + "\n", "own=" + wantAgent + " <nil>\n"} {
-		if !strings.Contains(string(out), want) {
+// testUnit returns a group standing in for the systemd unit agents run in.
+// Its name makes testManager's cleanup kill whatever is left in it.
+func testUnit(t *testing.T) *Group {
+	t.Helper()
+
+	unit, err := testManager(t, ModeEnforce).Create("unit")
+	if err != nil {
+		t.Fatalf("Create(unit) error = %v", err)
+	}
+	t.Cleanup(func() { unit.Close() }) //nolint:errcheck // Test cleanup.
+	return unit
+}
+
+func TestSetup(t *testing.T) {
+	t.Parallel()
+
+	unit := testUnit(t)
+	exited := &Manager{root: filepath.Join(unit.Path(), ownerGroupPrefix+strconv.Itoa(exitedAgentPID))}
+	if err := os.Mkdir(exited.root, 0o755); err != nil {
+		t.Fatalf("os.Mkdir(%q) error = %v", exited.root, err)
+	}
+	stale, err := exited.Create("stale")
+	if err != nil {
+		t.Fatalf("Create(stale) error = %v", err)
+	}
+	startInGroup(t, stale, `setsid nohup sleep 305 >/dev/null 2>&1 &`)
+	stalePID := awaitNames(t, stale, "sleep")[0].PID
+	stale.Close() //nolint:errcheck // Test cleanup.
+
+	out, pid := runSetup(t, unit)
+
+	wantRoot := filepath.Join(unit.Path(), ownerGroupPrefix+strconv.Itoa(pid))
+	wantAgent := filepath.Join(wantRoot, agentGroupName)
+	for _, want := range []string{"root=" + wantRoot + "\n", "own=" + wantAgent + " <nil>\n"} {
+		if !strings.Contains(out, want) {
 			t.Errorf("setup helper output = %q, want it to contain %q", out, want)
 		}
 	}
 	awaitDead(t, stalePID)
-	if _, err := os.Stat(stale.Path()); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("os.Stat(%q) error = %v, want the stale group removed", stale.Path(), err)
+	if _, err := os.Stat(filepath.Dir(stale.Path())); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("os.Stat(%q) error = %v, want the exited agent's groups removed", filepath.Dir(stale.Path()), err)
 	}
-	if _, err := os.Stat(filepath.Join(unit.Path(), "probe")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(wantRoot, "probe")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("probe group remains after setup: %v", err)
+	}
+}
+
+func TestSetupAndExitLeaveOtherRunningAgentsJobsAlone(t *testing.T) {
+	t.Parallel()
+
+	unit := testUnit(t)
+
+	running := helper(unit, "running-job")
+	stdin, err := running.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe() error = %v", err)
+	}
+	stdout, err := running.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe() error = %v", err)
+	}
+	if err := running.Start(); err != nil {
+		t.Fatalf("starting the running-job helper: %v", err)
+	}
+	t.Cleanup(func() {
+		stdin.Close()  //nolint:errcheck // Test cleanup.
+		running.Wait() //nolint:errcheck // Test cleanup.
+	})
+	if line, err := bufio.NewReader(stdout).ReadString('\n'); line != "ready\n" {
+		t.Fatalf("running-job helper printed %q, %v, want %q", line, err, "ready\n")
+	}
+	job := &Group{path: filepath.Join(unit.Path(), ownerGroupPrefix+strconv.Itoa(running.Process.Pid), jobGroupPrefix+"running")}
+	jobPID := awaitNames(t, job, "sleep")[0].PID
+
+	// A second agent in the same unit starts and then exits.
+	_, otherPID := runSetup(t, unit)
+	if !alive(jobPID) {
+		t.Fatalf("process %d was killed by another agent, want a running agent's job left alone", jobPID)
+	}
+
+	// Once its agent has exited, the job's process is a leftover.
+	stdin.Close()  //nolint:errcheck // Its error is the Wait's.
+	running.Wait() //nolint:errcheck // Only its exit matters.
+	_, lastPID := runSetup(t, unit)
+	awaitDead(t, jobPID)
+
+	for _, pid := range []int{running.Process.Pid, otherPID} {
+		path := filepath.Join(unit.Path(), ownerGroupPrefix+strconv.Itoa(pid))
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("os.Stat(%q) error = %v, want the exited agent's groups removed", path, err)
+		}
+	}
+	path := filepath.Join(unit.Path(), ownerGroupPrefix+strconv.Itoa(lastPID))
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("os.Stat(%q) error = %v, want the last agent's group kept until another agent starts", path, err)
 	}
 }

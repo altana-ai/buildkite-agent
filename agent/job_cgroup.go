@@ -6,9 +6,7 @@ import (
 	"strings"
 	"time"
 
-	envutil "github.com/buildkite/agent/v3/env"
 	"github.com/buildkite/agent/v3/internal/jobcgroup"
-	"github.com/buildkite/agent/v3/internal/redact"
 	"github.com/buildkite/agent/v3/logger"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -55,12 +53,9 @@ func (r *JobRunner) reportLeftoverProcesses() {
 	}
 	jobCgroupLeftoverProcesses.Add(float64(len(procs)))
 
-	// The agent sees argv unredacted, unlike the bootstrap's own output, so
-	// apply the job's redacted-vars before argv reaches the job log.
-	needles := r.redactionNeedles()
 	lines := make([]string, 0, len(procs))
 	for _, p := range procs {
-		lines = append(lines, fmt.Sprintf("%d %s", p.PID, redact.String(p.Command, needles)))
+		lines = append(lines, fmt.Sprintf("pid=%d ppid=%d name=%q", p.PID, p.PPID, p.Name))
 	}
 
 	when := "now"
@@ -77,37 +72,29 @@ func (r *JobRunner) reportLeftoverProcesses() {
 	).Warnf("Job left processes running after its bootstrap exited")
 }
 
-func (r *JobRunner) redactionNeedles() []string {
-	vars, _, err := redact.Vars(r.conf.AgentConfiguration.RedactedVars, envutil.FromMap(r.conf.Job.Env).DumpPairs())
-	if err != nil {
-		r.agentLogger.Warnf("[JobRunner] Couldn't match redacted-vars: %v", err)
-	}
-	needles := make([]string, 0, len(vars))
-	for _, v := range vars {
-		needles = append(needles, v.Value)
-	}
-	return needles
-}
-
-// killLeftovers kills everything the job left running and removes its
-// cgroup. It reports false only when processes survived, in which case
-// enforce mode taints the manager so the agent stops accepting jobs.
+// killLeftovers kills everything the job left running, then removes and
+// releases its cgroup, so it acts at most once per job. It reports false only
+// when processes survived, in which case enforce mode taints the manager so
+// the agent stops accepting jobs.
 func (r *JobRunner) killLeftovers() bool {
+	g, mode := r.jobCgroup, r.jobCgroupMode()
+	r.jobCgroup = nil
+
 	start := time.Now()
-	if err := r.jobCgroup.Close(); err != nil {
-		r.agentLogger.Warnf("[JobRunner] Couldn't close %s: %v", r.jobCgroup.Path(), err)
+	if err := g.Close(); err != nil {
+		r.agentLogger.Warnf("[JobRunner] Couldn't close %s: %v", g.Path(), err)
 	}
 
-	err := r.jobCgroup.Kill(jobcgroup.DrainTimeout)
+	err := g.Kill(jobcgroup.DrainTimeout)
 	switch {
 	case err == nil:
-		r.agentLogger.Debugf("[JobRunner] Killed and removed %s in %v", r.jobCgroup.Path(), time.Since(start))
+		r.agentLogger.Debugf("[JobRunner] Killed and removed %s in %v", g.Path(), time.Since(start))
 		return true
 
 	case errors.Is(err, jobcgroup.ErrNotEmpty):
 		jobCgroupKillFailures.Inc()
-		r.agentLogger.Errorf("Job %s: %s still has processes %v after SIGKILL", r.conf.Job.ID, r.jobCgroup.Path(), jobcgroup.DrainTimeout)
-		if r.jobCgroupMode() != jobcgroup.ModeEnforce {
+		r.agentLogger.Errorf("Job %s: %s still has processes %v after SIGKILL", r.conf.Job.ID, g.Path(), jobcgroup.DrainTimeout)
+		if mode != jobcgroup.ModeEnforce {
 			return true
 		}
 		_, _ = fmt.Fprintf(r.output, "+++ ⛔ Processes left by this job survived SIGKILL for %v, so this agent will stop accepting jobs\n", jobcgroup.DrainTimeout)
@@ -117,7 +104,15 @@ func (r *JobRunner) killLeftovers() bool {
 	default:
 		// The group emptied, or its state is unreadable. Either way, a stuck
 		// process has not been shown, so this is not a reason to stop.
-		r.agentLogger.Warnf("[JobRunner] Couldn't kill and remove %s: %v", r.jobCgroup.Path(), err)
+		r.agentLogger.Warnf("[JobRunner] Couldn't kill and remove %s: %v", g.Path(), err)
 		return true
+	}
+}
+
+// releaseJobCgroup removes the job's cgroup and closes its descriptor unless
+// cleanup already has, because the job can end before cleanup is set up.
+func (r *JobRunner) releaseJobCgroup() {
+	if r.jobCgroup != nil {
+		r.killLeftovers()
 	}
 }
