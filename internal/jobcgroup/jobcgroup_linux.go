@@ -130,51 +130,109 @@ func (m *Manager) probe() error {
 }
 
 // KillAll kills and removes every job group this agent process has created,
-// waiting up to timeout for each to empty. Other agents' groups are left
+// waiting up to timeout for them to empty. Other agents' groups are left
 // alone. The agent calls it as it exits.
 func (m *Manager) KillAll(timeout time.Duration) error {
-	entries, err := os.ReadDir(m.root)
+	paths, err := m.jobGroups()
 	if err != nil {
 		return err
 	}
-	var errs []error
+	errs := killGroups(paths, timeout)
+	return joinErrors(paths, errs)
+}
+
+// jobGroups returns the paths of the groups m has created for jobs and for
+// its probe.
+func (m *Manager) jobGroups() ([]string, error) {
+	entries, err := os.ReadDir(m.root)
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
 	for _, e := range entries {
-		if !e.IsDir() || !strings.HasPrefix(e.Name(), jobGroupPrefix) && e.Name() != "probe" {
-			continue
-		}
-		g := &Group{path: filepath.Join(m.root, e.Name())}
-		if err := g.Kill(timeout); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", g.path, err))
+		if e.IsDir() && (strings.HasPrefix(e.Name(), jobGroupPrefix) || e.Name() == "probe") {
+			paths = append(paths, filepath.Join(m.root, e.Name()))
 		}
 	}
-	return errors.Join(errs...)
+	return paths, nil
 }
 
 // killExited kills and removes the subtree of every agent under parent whose
-// process has exited, other than m's own. A subtree whose processes survive
-// is kept, and in enforce mode taints m, because a job's processes have
-// survived SIGKILL on this host just as if one of m's own jobs had left them.
+// process has exited, and any job groups already in m's own subtree. A group
+// whose processes survive is kept, and in enforce mode taints m, because a
+// job's processes have survived SIGKILL on this host just as if one of m's
+// own jobs had left them.
 func (m *Manager) killExited(parent string, timeout time.Duration) error {
 	entries, err := os.ReadDir(parent)
 	if err != nil {
 		return err
 	}
-	var errs []error
+	var paths []string
 	for _, e := range entries {
 		path := filepath.Join(parent, e.Name())
 		pid, ok := ownerPID(e)
-		if !ok || path == m.root || ownerRunning(parent, pid) {
-			continue
-		}
-		g := &Group{path: path}
-		if err := g.Kill(timeout); err != nil {
-			if errors.Is(err, ErrNotEmpty) && m.mode == ModeEnforce {
-				m.Taint()
+		switch {
+		case !ok:
+		case path == m.root:
+			// m has run no job yet, so these were left by an earlier agent
+			// with the same pid, as an agent that is always the same pid in
+			// its container would be.
+			own, err := m.jobGroups()
+			if err != nil {
+				return err
 			}
-			errs = append(errs, fmt.Errorf("%s: %w", path, err))
+			paths = append(paths, own...)
+		case !ownerRunning(parent, pid):
+			paths = append(paths, path)
 		}
 	}
-	return errors.Join(errs...)
+
+	errs := killGroups(paths, timeout)
+	for _, err := range errs {
+		if errors.Is(err, ErrNotEmpty) && m.mode == ModeEnforce {
+			m.Taint()
+		}
+	}
+	return joinErrors(paths, errs)
+}
+
+// killGroups kills every group at once, then waits for them against one
+// deadline, so that several stuck groups cost one timeout between them
+// rather than one each. It returns the error for each group it could not
+// kill and remove.
+func killGroups(paths []string, timeout time.Duration) map[string]error {
+	deadline := time.Now().Add(timeout)
+	errs := make(map[string]error)
+	var killed []string
+	for _, path := range paths {
+		if err := writeFile(filepath.Join(path, "cgroup.kill"), "1"); err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				errs[path] = err
+			}
+			continue
+		}
+		killed = append(killed, path)
+	}
+	for _, path := range killed {
+		if err := waitEmpty(path, time.Until(deadline)); err != nil {
+			errs[path] = err
+		} else if err := removeTree(path); err != nil {
+			errs[path] = err
+		}
+	}
+	return errs
+}
+
+// joinErrors joins the errors killGroups returned, each prefixed with its
+// group's path, in the order of paths.
+func joinErrors(paths []string, errs map[string]error) error {
+	var joined []error
+	for _, path := range paths {
+		if err := errs[path]; err != nil {
+			joined = append(joined, fmt.Errorf("%s: %w", path, err))
+		}
+	}
+	return errors.Join(joined...)
 }
 
 // ownerPID returns the pid of the agent that created the subtree e.
@@ -239,10 +297,22 @@ func (g *Group) Close() error {
 func (g *Group) Processes() ([]Process, error) {
 	var procs []Process
 	err := filepath.WalkDir(g.path, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || !d.IsDir() {
+		// The job can remove a group of its own while the walk is in it,
+		// and then that group has nothing left to report.
+		gone := func(err error) bool { return path != g.path && errors.Is(err, fs.ErrNotExist) }
+		if err != nil {
+			if gone(err) {
+				return nil
+			}
 			return err
 		}
+		if !d.IsDir() {
+			return nil
+		}
 		data, err := os.ReadFile(filepath.Join(path, "cgroup.procs"))
+		if gone(err) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -283,16 +353,7 @@ func stat(pid int) (name string, ppid int) {
 // ErrNotEmpty if the group is still populated at the deadline, and leaves the
 // group in place so that a later Kill can try again.
 func (g *Group) Kill(timeout time.Duration) error {
-	if err := writeFile(filepath.Join(g.path, "cgroup.kill"), "1"); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	if err := waitEmpty(g.path, timeout); err != nil {
-		return err
-	}
-	return removeTree(g.path)
+	return killGroups([]string{g.path}, timeout)[g.path]
 }
 
 func waitEmpty(path string, timeout time.Duration) error {

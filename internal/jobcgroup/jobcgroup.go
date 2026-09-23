@@ -73,7 +73,6 @@ type Group struct {
 	dir  *os.File
 }
 
-// Path returns the group's directory.
 func (g *Group) Path() string { return g.path }
 
 // Manager creates a group for each job under a root group that belongs to
@@ -94,10 +93,8 @@ func NewManager(mode Mode, root string) *Manager {
 	return &Manager{mode: mode, root: root, tainted: make(chan struct{})}
 }
 
-// Mode returns the manager's mode.
 func (m *Manager) Mode() Mode { return m.mode }
 
-// Root returns the directory that job groups are created under.
 func (m *Manager) Root() string { return m.root }
 
 // Taint records that a job's processes could not all be killed. In enforce

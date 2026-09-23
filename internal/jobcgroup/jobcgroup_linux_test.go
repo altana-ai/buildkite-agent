@@ -300,6 +300,77 @@ func TestKillExitedTaintsEnforceWhenAnExitedAgentsGroupDoesNotEmpty(t *testing.T
 	}
 }
 
+func TestKillExitedKillsJobGroupsLeftByAnAgentWithTheSamePID(t *testing.T) {
+	t.Parallel()
+
+	parent := testManager(t, ModeEnforce).Root()
+	m := NewManager(ModeEnforce, filepath.Join(parent, ownerGroupPrefix+strconv.Itoa(os.Getpid())))
+	if err := os.Mkdir(m.Root(), 0o755); err != nil {
+		t.Fatalf("os.Mkdir(%q) error = %v", m.Root(), err)
+	}
+	t.Cleanup(func() {
+		if err := removeTree(m.Root()); err != nil {
+			t.Errorf("removeTree(%q) error = %v", m.Root(), err)
+		}
+	})
+	old, err := m.Create("old")
+	if err != nil {
+		t.Fatalf("Create(old) error = %v", err)
+	}
+	startInGroup(t, old, `setsid nohup sleep 309 >/dev/null 2>&1 &`)
+	pid := awaitNames(t, old, "sleep")[0].PID
+	old.Close() //nolint:errcheck // Test cleanup.
+
+	if err := m.killExited(parent, DrainTimeout); err != nil {
+		t.Fatalf("killExited() error = %v", err)
+	}
+	awaitDead(t, pid)
+	if _, err := os.Stat(old.Path()); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("os.Stat(%q) error = %v, want the earlier agent's job group removed", old.Path(), err)
+	}
+}
+
+func TestKillAllWaitsForStuckGroupsTogether(t *testing.T) {
+	t.Parallel()
+
+	m := NewManager(ModeEnforce, t.TempDir())
+	for _, id := range []string{"a", "b", "c"} {
+		fakeStuckGroup(t, filepath.Join(m.Root(), jobGroupPrefix+id))
+	}
+
+	const timeout = time.Second
+	start := time.Now()
+	err := m.KillAll(timeout)
+	if elapsed := time.Since(start); elapsed > 2*timeout {
+		t.Errorf("KillAll() took %v, want about one %v timeout for all three groups", elapsed, timeout)
+	}
+	if !errors.Is(err, ErrNotEmpty) {
+		t.Errorf("KillAll() error = %v, want %v", err, ErrNotEmpty)
+	}
+}
+
+func TestProcessesSkipsAGroupRemovedDuringTheWalk(t *testing.T) {
+	t.Parallel()
+
+	// A plain directory stands in for the job's group. Its subdirectory has
+	// no cgroup.procs, as a group that the job removed mid-walk would not.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(cgroup.procs) error = %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "gone"), 0o755); err != nil {
+		t.Fatalf("os.Mkdir(gone) error = %v", err)
+	}
+
+	procs, err := (&Group{path: dir}).Processes()
+	if err != nil {
+		t.Fatalf("Processes() error = %v", err)
+	}
+	if len(procs) != 1 || procs[0].PID != os.Getpid() {
+		t.Errorf("Processes() = %+v, want only this process", procs)
+	}
+}
+
 func TestCreateRejectsPathLikeJobIDs(t *testing.T) {
 	t.Parallel()
 
