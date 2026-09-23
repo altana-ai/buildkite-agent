@@ -75,8 +75,8 @@ func (e *missingKeyError) Error() string {
 
 // Run runs the job.
 func (r *JobRunner) Run(ctx context.Context, ignoreAgentInDispatches *bool) (err error) {
-	// cleanup releases the job's cgroup at the point its mode requires. This
-	// covers the returns that come before cleanup is deferred.
+	// The cleanup method kills the job's cgroup at the point its mode
+	// requires, but Run can return before it defers cleanup.
 	defer r.releaseJobCgroup()
 
 	if r.cancelled.Load() {
