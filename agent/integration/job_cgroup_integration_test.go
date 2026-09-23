@@ -3,12 +3,15 @@
 package integration
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -53,7 +56,7 @@ func testJobCgroup(t *testing.T, mode jobcgroup.Mode) *jobcgroup.Manager {
 
 	m := jobcgroup.NewManager(mode, root)
 	t.Cleanup(func() {
-		if err := m.KillAll(); err != nil {
+		if err := m.KillAll(jobcgroup.DrainTimeout); err != nil {
 			t.Errorf("KillAll() error = %v", err)
 		}
 		if err := syscall.Rmdir(root); err != nil {
@@ -67,6 +70,13 @@ func testJobCgroup(t *testing.T, mode jobcgroup.Mode) *jobcgroup.Manager {
 // with $DIR set to dir.
 func newScriptJobRunner(t *testing.T, server, jobID, dir, script string, conf agent.AgentConfiguration) *agent.JobRunner {
 	t.Helper()
+	return newLoggedScriptJobRunner(t, logger.Discard, server, jobID, dir, script, conf)
+}
+
+// newLoggedScriptJobRunner is newScriptJobRunner with the agent log going to
+// l.
+func newLoggedScriptJobRunner(t *testing.T, l logger.Logger, server, jobID, dir, script string, conf agent.AgentConfiguration) *agent.JobRunner {
+	t.Helper()
 
 	path := filepath.Join(dir, "bootstrap.sh")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
@@ -74,7 +84,6 @@ func newScriptJobRunner(t *testing.T, server, jobID, dir, script string, conf ag
 	}
 	conf.BootstrapScript = "/bin/sh " + path
 
-	l := logger.Discard
 	jr, err := agent.NewJobRunner(t.Context(), l, api.NewClient(l, api.Config{Endpoint: server, Token: "llamasrock"}), agent.JobRunnerConfig{
 		Job: &api.Job{
 			ID:                 jobID,
@@ -142,6 +151,35 @@ func assertNoJobGroups(t *testing.T, m *jobcgroup.Manager) {
 			t.Errorf("job group %s remains after the job", e.Name())
 		}
 	}
+
+	fds, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatalf("os.ReadDir(/proc/self/fd) error = %v", err)
+	}
+	for _, fd := range fds {
+		if target, err := os.Readlink(filepath.Join("/proc/self/fd", fd.Name())); err == nil && strings.HasPrefix(target, m.Root()+"/") {
+			t.Errorf("descriptor %s for %s remains open after the job", fd.Name(), target)
+		}
+	}
+}
+
+// lockedBuffer is a bytes.Buffer that a logger can write to from several
+// goroutines.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func TestJobCgroup_KillsProcessesThatEscapedTheProcessGroup(t *testing.T) {
@@ -179,7 +217,7 @@ func TestJobCgroup_KillsProcessesThatEscapedTheProcessGroup(t *testing.T) {
 				if want := "2 processes outlived the job"; !strings.Contains(logs, want) {
 					t.Errorf("job log = %q, want it to contain %q", logs, want)
 				}
-				if want := "sleep 300"; !strings.Contains(logs, want) {
+				if want := `name="sleep"`; !strings.Contains(logs, want) {
 					t.Errorf("job log = %q, want it to contain %q", logs, want)
 				}
 				assertNoJobGroups(t, m)
@@ -291,5 +329,88 @@ func TestJobCgroup_JobRunsOutsideAGroupThatCannotBeCreated(t *testing.T) {
 	}
 	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("os.Stat(%q) error = %v, want it still missing", missing, err)
+	}
+}
+
+func TestJobCgroup_LeftoverReportShowsNoArguments(t *testing.T) {
+	t.Parallel()
+
+	m := testJobCgroup(t, jobcgroup.ModeEnforce)
+	e := createTestAgentEndpoint()
+	server := e.server()
+	defer server.Close()
+
+	// The secret reaches the leftover's arguments without passing through the
+	// job's environment, as one that a hook exports would.
+	const secret = "s3cret-from-a-hook"
+	var agentLog lockedBuffer
+	l := logger.NewConsoleLogger(logger.NewJSONPrinter(&agentLog), func(int) {})
+	dir := t.TempDir()
+	jr := newLoggedScriptJobRunner(t, l, server.URL, "secretive-job", dir, `
+setsid nohup sh -c 'echo $$ > "$DIR/leak.pid"; while :; do sleep 1; done' leaky --token=`+secret+` >/dev/null 2>&1 &
+while [ ! -s "$DIR/leak.pid" ]; do sleep 0.05; done
+`, agent.AgentConfiguration{RunInPty: true, JobCgroup: m})
+	if err := jr.Run(t.Context(), nil); err != nil {
+		t.Fatalf("jr.Run() error = %v", err)
+	}
+
+	logs := e.logsFor(t, "secretive-job")
+	if want := `name="sh"`; !strings.Contains(logs, want) {
+		t.Errorf("job log = %q, want it to contain %q", logs, want)
+	}
+	if want := "leftover_processes"; !strings.Contains(agentLog.String(), want) {
+		t.Errorf("agent log = %q, want it to contain %q", agentLog.String(), want)
+	}
+	for name, log := range map[string]string{"job log": logs, "agent log": agentLog.String()} {
+		if strings.Contains(log, secret) {
+			t.Errorf("%s = %q, want no leftover's arguments in it", name, log)
+		}
+	}
+	if pid := readPID(t, filepath.Join(dir, "leak.pid")); !awaitExit(pid) {
+		syscall.Kill(pid, syscall.SIGKILL) //nolint:errcheck // Test cleanup.
+		t.Errorf("process %d outlived the job", pid)
+	}
+	assertNoJobGroups(t, m)
+}
+
+func TestJobCgroup_ReleasesTheGroupOfAJobThatNeverRuns(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		routes []route
+		cancel bool
+	}{
+		// For example, because another agent has already started the job.
+		"start rejected": {routes: []route{{
+			Method:      "PUT",
+			Path:        "/jobs/{id}/start",
+			HandlerFunc: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusUnprocessableEntity) },
+		}}},
+		"cancelled before running": {cancel: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			m := testJobCgroup(t, jobcgroup.ModeEnforce)
+			e := createTestAgentEndpoint()
+			server := e.server(test.routes...)
+			defer server.Close()
+
+			dir := t.TempDir()
+			jr := newScriptJobRunner(t, server.URL, "unrun-job", dir, `touch "$DIR/ran"`+"\n", agent.AgentConfiguration{JobCgroup: m})
+			if test.cancel {
+				if err := jr.Cancel(agent.CancelReasonJobState); err != nil {
+					t.Fatalf("jr.Cancel() error = %v", err)
+				}
+			}
+			if err := jr.Run(t.Context(), nil); err == nil {
+				t.Fatal("jr.Run() error = nil, want the job not to run")
+			}
+
+			if _, err := os.Stat(filepath.Join(dir, "ran")); err == nil {
+				t.Error("the bootstrap ran, want it never started")
+			}
+			assertNoJobGroups(t, m)
+		})
 	}
 }
