@@ -7,6 +7,7 @@ import (
 	"github.com/buildkite/agent/v3/api"
 	"github.com/buildkite/agent/v3/env"
 	"github.com/buildkite/agent/v3/internal/job"
+	"github.com/buildkite/agent/v3/internal/jobcgroup"
 )
 
 // AgentConfiguration is the run-time configuration for an agent that
@@ -53,6 +54,10 @@ type AgentConfiguration struct {
 	KubernetesExec                  bool
 	KubernetesContainerStartTimeout time.Duration
 	JobContextDir                   string
+
+	// JobCgroup runs each job in its own cgroup. It is nil when job-cgroup is
+	// off or the host cannot support it.
+	JobCgroup *jobcgroup.Manager
 
 	SigningJWKSFile  string // Where to find the key to sign pipeline uploads with (passed through to jobs, they might be uploading pipelines)
 	SigningJWKSKeyID string // The key ID to sign pipeline uploads with
