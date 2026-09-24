@@ -205,13 +205,22 @@ func killGroups(paths []string, timeout time.Duration) map[string]error {
 	errs := make(map[string]error)
 	var killed []string
 	for _, path := range paths {
-		if err := writeFile(filepath.Join(path, "cgroup.kill"), "1"); err != nil {
-			if !errors.Is(err, fs.ErrNotExist) {
+		err := writeFile(filepath.Join(path, "cgroup.kill"), "1")
+		switch {
+		case err == nil:
+			killed = append(killed, path)
+		case errors.Is(err, fs.ErrNotExist):
+			// Another caller has already removed the group.
+		default:
+			if populated, perr := isPopulated(path); perr == nil && !populated {
+				err = removeTree(path)
+			} else {
+				err = errors.Join(ErrNotEmpty, err)
+			}
+			if err != nil {
 				errs[path] = err
 			}
-			continue
 		}
-		killed = append(killed, path)
 	}
 	for _, path := range killed {
 		if err := waitEmpty(path, time.Until(deadline)); err != nil {
@@ -245,16 +254,27 @@ func ownerPID(e fs.DirEntry) (int, bool) {
 	return pid, err == nil && pid > 0
 }
 
-// ownerRunning reports whether the agent with pid is still running, which it
-// is only while its process is in parent, about to move, or in its own
-// subtree's agent group. A later process that reuses the pid is elsewhere.
+// ownerRunning reports whether the agent with pid may still be running.
+// Killing a running agent's subtree kills its jobs, so any doubt counts as
+// running.
 func ownerRunning(parent string, pid int) bool {
+	agentGroup := filepath.Join(parent, ownerGroupPrefix+strconv.Itoa(pid), agentGroupName)
+
+	// A process in the agent group may be the owner even where /proc does
+	// not show it, as when it is in another pid namespace.
+	populated, err := isPopulated(agentGroup)
+	if populated || err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+
+	// Otherwise the owner can only be in parent, about to move. A later
+	// process that reuses the pid is elsewhere.
 	own, err := cgroupOf(strconv.Itoa(pid))
 	if err != nil {
-		return false
+		return !errors.Is(err, fs.ErrNotExist)
 	}
 	path := filepath.Join(cgroupFS, own)
-	return path == parent || path == filepath.Join(parent, ownerGroupPrefix+strconv.Itoa(pid), agentGroupName)
+	return path == parent || path == agentGroup
 }
 
 // Create creates the group for a job and opens it, ready to be passed to
@@ -350,8 +370,9 @@ func stat(pid int) (name string, ppid int) {
 
 // Kill sends SIGKILL to every process in the group and its descendant groups,
 // waits up to timeout for the group to empty, then removes it. It returns
-// ErrNotEmpty if the group is still populated at the deadline, and leaves the
-// group in place so that a later Kill can try again.
+// ErrNotEmpty if the group is still populated at the deadline, or cannot be
+// killed or shown to be empty, and leaves the group in place so that a later
+// Kill can try again.
 func (g *Group) Kill(timeout time.Duration) error {
 	return killGroups([]string{g.path}, timeout)[g.path]
 }
@@ -362,7 +383,13 @@ func waitEmpty(path string, timeout time.Duration) error {
 	for {
 		populated, err := isPopulated(path)
 		if err != nil {
-			return err
+			if _, serr := os.Stat(path); errors.Is(serr, fs.ErrNotExist) {
+				// Another caller has already removed the group.
+				return nil
+			}
+			// A group whose processes cannot be shown to be gone counts
+			// as not empty, so that enforce mode fails closed.
+			return errors.Join(ErrNotEmpty, err)
 		}
 		if !populated {
 			return nil
@@ -398,8 +425,12 @@ func isPopulated(path string) (bool, error) {
 
 // removeTree removes a group and its descendants, deepest first. cgroupfs
 // rejects unlinking its interface files, so os.RemoveAll cannot be used.
+// A group that is already gone, removed by another caller, is not an error.
 func removeTree(path string) error {
 	entries, err := os.ReadDir(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -410,7 +441,10 @@ func removeTree(path string) error {
 			}
 		}
 	}
-	return unix.Rmdir(path)
+	if err := unix.Rmdir(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // writeFile writes to an existing cgroup interface file. os.WriteFile would

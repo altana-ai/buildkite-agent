@@ -11,6 +11,19 @@ import (
 	"github.com/buildkite/agent/v3/logger"
 )
 
+func TestRefuseTaintedStart(t *testing.T) {
+	t.Parallel()
+
+	// An agent service exits 0 so that systemd does not restart it.
+	if err := refuseTaintedStart(logger.Discard, ""); err != nil {
+		t.Errorf("refuseTaintedStart(no acquire-job) = %v, want nil", err)
+	}
+	// An acquire-job caller must not read the refusal as a passing job.
+	if err := refuseTaintedStart(logger.Discard, "some-job"); err == nil {
+		t.Error("refuseTaintedStart(acquire-job) = nil, want an error")
+	}
+}
+
 func TestPoolSignals_ExitingImmediatelyRunsBeforeExitFirst(t *testing.T) {
 	t.Parallel()
 

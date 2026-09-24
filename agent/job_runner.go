@@ -161,6 +161,11 @@ type JobRunner struct {
 	droppedRemoteMirrorURL string
 	// jobCgroup is the job's cgroup, or nil if the job runs outside one.
 	jobCgroup *jobcgroup.Group
+
+	// postExitLogs reaches every destination of jobLogs except the pipes
+	// that close when the bootstrap exits, at which point io.MultiWriter
+	// would drop every write to jobLogs at the first closed one.
+	postExitLogs io.Writer
 }
 
 // jobProcess is either a *process.Process, or a *kubernetes.Runner.
@@ -336,12 +341,16 @@ func NewJobRunner(ctx context.Context, l logger.Logger, apiClient *api.Client, c
 		}()
 	}
 
+	postExitWriters := []io.Writer{outputWriter}
 	if conf.AgentConfiguration.WriteJobLogsToStdout {
-		allWriters = append(allWriters, NewJobLogger(conf))
+		jobLogger := NewJobLogger(conf)
+		allWriters = append(allWriters, jobLogger)
+		postExitWriters = append(postExitWriters, jobLogger)
 	}
 
 	// The writer that output from the process goes into
 	r.jobLogs = io.MultiWriter(allWriters...)
+	r.postExitLogs = io.MultiWriter(postExitWriters...)
 
 	// Copy the current processes ENV and merge in the new ones. We do this
 	// so the sub process gets PATH and stuff. We merge our path in over

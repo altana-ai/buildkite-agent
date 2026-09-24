@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -70,12 +71,12 @@ func testJobCgroup(t *testing.T, mode jobcgroup.Mode) *jobcgroup.Manager {
 // with $DIR set to dir.
 func newScriptJobRunner(t *testing.T, server, jobID, dir, script string, conf agent.AgentConfiguration) *agent.JobRunner {
 	t.Helper()
-	return newLoggedScriptJobRunner(t, logger.Discard, server, jobID, dir, script, conf)
+	return newLoggedScriptJobRunner(t, logger.Discard, io.Discard, server, jobID, dir, script, conf)
 }
 
 // newLoggedScriptJobRunner is newScriptJobRunner with the agent log going to
-// l.
-func newLoggedScriptJobRunner(t *testing.T, l logger.Logger, server, jobID, dir, script string, conf agent.AgentConfiguration) *agent.JobRunner {
+// l and the agent's stdout to stdout.
+func newLoggedScriptJobRunner(t *testing.T, l logger.Logger, stdout io.Writer, server, jobID, dir, script string, conf agent.AgentConfiguration) *agent.JobRunner {
 	t.Helper()
 
 	path := filepath.Join(dir, "bootstrap.sh")
@@ -92,6 +93,7 @@ func newLoggedScriptJobRunner(t *testing.T, l logger.Logger, server, jobID, dir,
 			Token:              "bkaj_job-token",
 		},
 		AgentConfiguration: conf,
+		AgentStdout:        stdout,
 		MetricsScope:       metrics.NewCollector(l, metrics.CollectorConfig{}).Scope(metrics.Tags{}),
 		JobStatusInterval:  1 * time.Second,
 	})
@@ -343,13 +345,13 @@ func TestJobCgroup_LeftoverReportShowsNoArguments(t *testing.T) {
 	// The secret reaches the leftover's arguments without passing through the
 	// job's environment, as one that a hook exports would.
 	const secret = "s3cret-from-a-hook"
-	var agentLog lockedBuffer
+	var agentLog, stdout lockedBuffer
 	l := logger.NewConsoleLogger(logger.NewJSONPrinter(&agentLog), func(int) {})
 	dir := t.TempDir()
-	jr := newLoggedScriptJobRunner(t, l, server.URL, "secretive-job", dir, `
+	jr := newLoggedScriptJobRunner(t, l, &stdout, server.URL, "secretive-job", dir, `
 setsid nohup sh -c 'echo $$ > "$DIR/leak.pid"; while :; do sleep 1; done' leaky --token=`+secret+` >/dev/null 2>&1 &
 while [ ! -s "$DIR/leak.pid" ]; do sleep 0.05; done
-`, agent.AgentConfiguration{RunInPty: true, JobCgroup: m})
+`, agent.AgentConfiguration{RunInPty: true, JobCgroup: m, WriteJobLogsToStdout: true})
 	if err := jr.Run(t.Context(), nil); err != nil {
 		t.Fatalf("jr.Run() error = %v", err)
 	}
@@ -361,7 +363,11 @@ while [ ! -s "$DIR/leak.pid" ]; do sleep 0.05; done
 	if want := "leftover_processes"; !strings.Contains(agentLog.String(), want) {
 		t.Errorf("agent log = %q, want it to contain %q", agentLog.String(), want)
 	}
-	for name, log := range map[string]string{"job log": logs, "agent log": agentLog.String()} {
+	// The copy of the job log on the agent's stdout gets the report too.
+	if want := "processes outlived the job"; !strings.Contains(stdout.String(), want) {
+		t.Errorf("agent stdout = %q, want it to contain %q", stdout.String(), want)
+	}
+	for name, log := range map[string]string{"job log": logs, "agent log": agentLog.String(), "agent stdout": stdout.String()} {
 		if strings.Contains(log, secret) {
 			t.Errorf("%s = %q, want no leftover's arguments in it", name, log)
 		}

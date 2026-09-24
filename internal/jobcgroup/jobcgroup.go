@@ -40,7 +40,8 @@ const (
 const DrainTimeout = 30 * time.Second
 
 // ErrNotEmpty is returned by Group.Kill when processes remain in the group
-// after DrainTimeout.
+// after DrainTimeout, or when the group cannot be killed or shown to be
+// empty.
 var ErrNotEmpty = errors.New("job cgroup still has processes after being killed")
 
 // ParseMode parses the job-cgroup setting. The empty string means off.
