@@ -27,13 +27,22 @@ var (
 	})
 )
 
+// jobCgroupSetting is the agent's job-cgroup setting, which applies even to a
+// job whose own group could not be created.
+func (r *JobRunner) jobCgroupSetting() jobcgroup.Mode {
+	if m := r.conf.AgentConfiguration.JobCgroup; m != nil {
+		return m.Mode()
+	}
+	return jobcgroup.ModeOff
+}
+
 // jobCgroupMode is off when the job is not running in a cgroup, including
 // when its group could not be created.
 func (r *JobRunner) jobCgroupMode() jobcgroup.Mode {
 	if r.jobCgroup == nil {
 		return jobcgroup.ModeOff
 	}
-	return r.conf.AgentConfiguration.JobCgroup.Mode()
+	return r.jobCgroupSetting()
 }
 
 // reportLeftoverProcesses writes whatever is still running in the job's
@@ -85,10 +94,9 @@ func leftoverLines(procs []jobcgroup.Process) []string {
 }
 
 // killLeftovers kills everything the job left running, then removes and
-// releases its cgroup, so it acts at most once per job. It reports false only
-// when processes survived, in which case enforce mode taints the manager so
-// the agent stops accepting jobs.
-func (r *JobRunner) killLeftovers() bool {
+// releases its cgroup, so it acts at most once per job. If processes survive
+// in enforce mode, it taints the manager so the agent stops accepting jobs.
+func (r *JobRunner) killLeftovers() {
 	g, mode := r.jobCgroup, r.jobCgroupMode()
 	r.jobCgroup = nil
 
@@ -101,23 +109,20 @@ func (r *JobRunner) killLeftovers() bool {
 	switch {
 	case err == nil:
 		r.agentLogger.Debugf("[JobRunner] Killed and removed %s in %v", g.Path(), time.Since(start))
-		return true
 
 	case errors.Is(err, jobcgroup.ErrNotEmpty):
 		jobCgroupKillFailures.Inc()
 		r.agentLogger.Errorf("Job %s: couldn't kill every process in %s within %v: %v", r.conf.Job.ID, g.Path(), jobcgroup.DrainTimeout, err)
 		if mode != jobcgroup.ModeEnforce {
-			return true
+			return
 		}
 		_, _ = fmt.Fprintf(r.postExitLogs, "+++ ⛔ Processes left by this job could not all be killed within %v, so this agent will stop accepting jobs\n", jobcgroup.DrainTimeout)
 		r.conf.AgentConfiguration.JobCgroup.Taint()
-		return false
 
 	default:
 		// The group emptied but could not be removed, so no process
 		// survived and this is not a reason to stop.
 		r.agentLogger.Warnf("[JobRunner] Couldn't kill and remove %s: %v", g.Path(), err)
-		return true
 	}
 }
 

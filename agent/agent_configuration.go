@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/buildkite/agent/v3/internal/jobcgroup"
+	"github.com/buildkite/agent/v3/internal/jobcontainers"
 )
 
 // AgentConfiguration is the run-time configuration for an agent that
@@ -52,6 +53,10 @@ type AgentConfiguration struct {
 	// JobCgroup runs each job in its own cgroup. It is nil when job-cgroup is
 	// off or the host cannot support it.
 	JobCgroup *jobcgroup.Manager
+
+	// JobContainers removes the Docker containers each job leaves running.
+	// It is nil exactly when JobCgroup is.
+	JobContainers *jobcontainers.Sweeper
 
 	SigningJWKSFile  string // Where to find the key to sign pipeline uploads with (passed through to jobs, they might be uploading pipelines)
 	SigningJWKSKeyID string // The key ID to sign pipeline uploads with

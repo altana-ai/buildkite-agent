@@ -550,6 +550,7 @@ func (a *AgentWorker) RunJob(ctx context.Context, acceptResponse *api.Job, ignor
 		MetricsScope:                    jobMetricsScope,
 		JobStatusInterval:               time.Duration(a.agent.JobStatusInterval) * time.Second,
 		AgentConfiguration:              a.agentConfiguration,
+		AgentName:                       a.agent.Name,
 		AgentStdout:                     a.agentStdout,
 		KubernetesExec:                  a.agentConfiguration.KubernetesExec,
 		KubernetesContainerStartTimeout: a.agentConfiguration.KubernetesContainerStartTimeout,

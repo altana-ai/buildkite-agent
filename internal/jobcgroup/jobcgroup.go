@@ -106,3 +106,13 @@ func (m *Manager) Taint() {
 
 // Tainted returns a channel that is closed once Taint has been called.
 func (m *Manager) Tainted() <-chan struct{} { return m.tainted }
+
+// IsTainted reports whether Taint has been called.
+func (m *Manager) IsTainted() bool {
+	select {
+	case <-m.tainted:
+		return true
+	default:
+		return false
+	}
+}

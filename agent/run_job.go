@@ -218,6 +218,7 @@ func (r *JobRunner) Run(ctx context.Context, ignoreAgentInDispatches *bool) (err
 	wg.Go(func() { r.streamJobLogsAfterProcessStart(cctx) })
 	wg.Go(func() { r.jobCancellationChecker(cctx) })
 
+	r.snapshotContainers(ctx)
 	exit = r.runJob(cctx)
 	// The defer mutates the error return in some cases.
 	return nil
@@ -408,7 +409,14 @@ func (r *JobRunner) cleanup(ctx context.Context, wg *sync.WaitGroup, exit core.P
 	if mode != jobcgroup.ModeOff {
 		r.reportLeftoverProcesses()
 	}
-	if mode == jobcgroup.ModeEnforce && !r.killLeftovers() {
+	if mode == jobcgroup.ModeEnforce {
+		r.killLeftovers()
+	}
+	r.sweepContainers(ctx)
+	// Whatever tainted the agent, whether this job's leftovers, this job
+	// running outside a group, or a sibling worker's job, the agent is about
+	// to stop and must not be dispatched another job first.
+	if r.jobCgroupSetting() == jobcgroup.ModeEnforce && r.conf.AgentConfiguration.JobCgroup.IsTainted() {
 		ignoreAgentInDispatches = ptr.To(true)
 	}
 

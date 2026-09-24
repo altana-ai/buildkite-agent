@@ -842,6 +842,12 @@ func dirForAgentName(agentName string) string {
 	return badCharsRE.ReplaceAllString(agentName, "-")
 }
 
+// AgentBuildDir is the directory under buildPath that holds every checkout
+// made by the agent named agentName.
+func AgentBuildDir(buildPath, agentName string) string {
+	return filepath.Join(buildPath, dirForAgentName(agentName))
+}
+
 func dirForRepository(repository string) string {
 	return badCharsRE.ReplaceAllString(repository, "-")
 }
