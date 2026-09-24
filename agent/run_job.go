@@ -413,9 +413,8 @@ func (r *JobRunner) cleanup(ctx context.Context, wg *sync.WaitGroup, exit core.P
 		r.killLeftovers()
 	}
 	r.sweepContainers(ctx)
-	// Whatever tainted the agent, whether this job's leftovers, this job
-	// running outside a group, or a sibling worker's job, the agent is about
-	// to stop and must not be dispatched another job first.
+	// Whatever tainted the agent, even a sibling worker's job, it is about to
+	// stop and must not be dispatched another job first.
 	if r.jobCgroupSetting() == jobcgroup.ModeEnforce && r.conf.AgentConfiguration.JobCgroup.IsTainted() {
 		ignoreAgentInDispatches = ptr.To(true)
 	}

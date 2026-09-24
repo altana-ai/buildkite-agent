@@ -63,6 +63,10 @@ func (d *jobDocker) RunningContainers(context.Context) ([]string, error) {
 	return ids, nil
 }
 
+func (d *jobDocker) Containers(ctx context.Context) ([]string, error) {
+	return d.RunningContainers(ctx)
+}
+
 func (d *jobDocker) Inspect(_ context.Context, ids []string) ([]jobcontainers.Container, error) {
 	var found []jobcontainers.Container
 	for _, id := range ids {
@@ -178,7 +182,7 @@ func TestJobCgroup_ContainersTheJobLeftRunning(t *testing.T) {
 			if !strings.Contains(logs, test.wantLog) {
 				t.Errorf("job log = %q, want it to contain %q", logs, test.wantLog)
 			}
-			if want := `id=0123456789ab name="itest-db" image="postgres:16" matched="started during the job"`; !strings.Contains(logs, want) {
+			if want := `id=0123456789ab name="itest-db" image="postgres:16" matched="created during the job"`; !strings.Contains(logs, want) {
 				t.Errorf("job log = %q, want it to contain %q", logs, want)
 			}
 			if want := "leftover_containers"; !strings.Contains(agentLog.String(), want) {

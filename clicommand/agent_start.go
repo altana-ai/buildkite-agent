@@ -431,7 +431,7 @@ var AgentStartCommand = cli.Command{
 		cli.StringFlag{
 			Name:   "job-cgroup",
 			Value:  "off",
-			Usage:  "Run each job in its own cgroup v2 group and kill whatever it leaves running before the next job, even processes that left the job's process group. Docker containers the job left running are also listed, and in ′enforce′ removed: on a host with one worker, every container started during the job, and with several workers, those with the job's ID label or a bind mount or compose working dir in the worker's build dir. One of ′off′, ′report′ (kill processes after the job's result is reported, and leave containers running) or ′enforce′ (kill and remove before the job is marked finished, and stop accepting jobs if any process or container survives). Linux only, and the agent's own cgroup must be delegated to it, for example with systemd ′Delegate=pids′",
+			Usage:  "Run each job in its own cgroup v2 group and kill whatever it leaves running before the next job, even processes that left the job's process group. Docker containers the job left running are also listed, and in ′enforce′ removed: with one worker, every container created during the job, and with several workers in this agent process, those with the job's ID label or a bind mount or compose working dir in the worker's build dir. One of ′off′, ′report′ (kill processes after the job's result is reported, and leave containers running) or ′enforce′ (kill and remove before the job is marked finished, and stop accepting jobs if any process or container survives). Linux only, and the agent's own cgroup must be delegated to it, for example with systemd ′Delegate=pids′",
 			EnvVar: "BUILDKITE_JOB_CGROUP",
 		},
 		cli.BoolFlag{

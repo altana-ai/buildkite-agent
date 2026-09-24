@@ -8,7 +8,9 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -69,18 +71,19 @@ func TestSweeper_RealDockerOnASharedHost(t *testing.T) {
 	jobID := fmt.Sprintf("jobcontainers-test-job-%d", time.Now().UnixNano())
 	buildDir := t.TempDir()
 
-	labelled := runContainer(t, "--label", "com.buildkite.job-id="+jobID)
-	mounted := runContainer(t, "--volume", buildDir+":/src")
-	// SIGTERM does not stop sleep as PID 1, so this also shows the kill
-	// after the stop timeout.
-	unrelated := runContainer(t, "--label", "com.buildkite.job-id=another-job")
-
 	s := New(c, true)
 	ctx := t.Context()
 	snap, err := s.Snapshot(ctx)
 	if err != nil {
 		t.Fatalf("s.Snapshot() error = %v", err)
 	}
+
+	labelled := runContainer(t, "--label", "com.buildkite.job-id="+jobID)
+	mounted := runContainer(t, "--volume", buildDir+":/src")
+	// SIGTERM does not stop sleep as PID 1, so this also shows the kill
+	// after the stop timeout.
+	unrelated := runContainer(t, "--label", "com.buildkite.job-id=another-job")
+
 	leftovers, err := s.Leftovers(ctx, snap, Job{ID: jobID, BuildDir: buildDir})
 	if err != nil {
 		t.Fatalf("s.Leftovers() error = %v", err)
@@ -110,5 +113,117 @@ func TestSweeper_RealDockerOnASharedHost(t *testing.T) {
 	}
 	if !slices.Contains(running, unrelated) {
 		t.Errorf("container %s from another job was removed, want it left running", unrelated)
+	}
+}
+
+// isolatedDocker returns a CLI for the daemon at
+// $JOBCONTAINERS_TEST_ISOLATED_DOCKER_HOST, such as a docker:dind container,
+// and a function that runs docker commands against it. It skips the test
+// otherwise, because the one-agent sweep removes every container that
+// starts while it runs.
+func isolatedDocker(t *testing.T) (CLI, func(args ...string) string) {
+	t.Helper()
+
+	host := os.Getenv("JOBCONTAINERS_TEST_ISOLATED_DOCKER_HOST")
+	if host == "" {
+		t.Skip("JOBCONTAINERS_TEST_ISOLATED_DOCKER_HOST is not set to a disposable Docker daemon")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skipf("no docker command: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "docker")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexec docker -H '"+host+"' \"$@\"\n"), 0o755); err != nil {
+		t.Fatalf("os.WriteFile(%q) error = %v", path, err)
+	}
+	run := func(args ...string) string {
+		t.Helper()
+		var stderr strings.Builder
+		cmd := exec.Command(path, args...)
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("docker %s: %v: %s", strings.Join(args, " "), err, stderr.String())
+		}
+		return strings.TrimSpace(string(out))
+	}
+	return CLI{Path: path}, run
+}
+
+func TestSweeper_IsolatedDockerWithOneAgent(t *testing.T) {
+	c, docker := isolatedDocker(t)
+	sleeper := func(args ...string) string {
+		return docker(append(append([]string{"run", "--detach", "--pull", "never"}, args...), testImage, "sleep", "300")...)
+	}
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+
+	preNetwork := docker("network", "create", "pre-net-"+suffix)
+	preVolume := "pre-vol-" + suffix
+	docker("volume", "create", preVolume)
+	pre := sleeper("--network", preNetwork, "--volume", preVolume+":/v")
+	stoppedBefore := sleeper()
+	docker("stop", "--time", "0", stoppedBefore)
+	jobVolume := "job-vol-" + suffix
+	t.Cleanup(func() {
+		docker("rm", "--force", pre, stoppedBefore)
+		docker("network", "rm", preNetwork)
+		docker("volume", "rm", preVolume, jobVolume)
+	})
+
+	s := New(c, false)
+	ctx := t.Context()
+	snap, err := s.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("s.Snapshot() error = %v", err)
+	}
+
+	// The job restarting a container it did not create does not make it the
+	// job's.
+	docker("start", stoppedBefore)
+	jobNetwork := docker("network", "create", "job-net-"+suffix)
+	withNamedVolume := sleeper("--network", jobNetwork, "--volume", jobVolume+":/v")
+	withAnonymousVolume := sleeper("--volume", "/data")
+	anonymousVolume := docker("container", "inspect", "--format", "{{range .Mounts}}{{.Name}}{{end}}", withAnonymousVolume)
+
+	leftovers, err := s.Leftovers(ctx, snap, Job{ID: "job-" + suffix, BuildDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("s.Leftovers() error = %v", err)
+	}
+	got := map[string]Reason{}
+	for _, l := range leftovers {
+		got[l.ID] = l.Reason
+	}
+	want := map[string]Reason{withNamedVolume: ReasonCreatedDuringJob, withAnonymousVolume: ReasonCreatedDuringJob}
+	if !maps.Equal(got, want) {
+		t.Fatalf("s.Leftovers() = %v, want %v", got, want)
+	}
+	if err := s.Remove(ctx, leftovers); err != nil {
+		t.Fatalf("s.Remove() error = %v", err)
+	}
+	if err := s.RemoveNetworks(ctx, snap); err != nil {
+		t.Fatalf("s.RemoveNetworks() error = %v", err)
+	}
+
+	got = map[string]Reason{}
+	for _, id := range strings.Fields(docker("ps", "--all", "--quiet", "--no-trunc")) {
+		got[id] = ""
+	}
+	if want := map[string]Reason{pre: "", stoppedBefore: ""}; !maps.Equal(got, want) {
+		t.Errorf("containers = %v, want only those from before the job, %v", got, want)
+	}
+	networks := strings.Fields(docker("network", "ls", "--quiet", "--no-trunc"))
+	if !slices.Contains(networks, preNetwork) {
+		t.Errorf("network %s from before the job was removed", preNetwork)
+	}
+	if slices.Contains(networks, jobNetwork) {
+		t.Errorf("network %s the job created is still there", jobNetwork)
+	}
+	volumes := strings.Fields(docker("volume", "ls", "--quiet"))
+	for _, v := range []string{preVolume, jobVolume} {
+		if !slices.Contains(volumes, v) {
+			t.Errorf("named volume %s was removed, want every named volume kept", v)
+		}
+	}
+	if slices.Contains(volumes, anonymousVolume) {
+		t.Errorf("anonymous volume %s of a removed container is still there", anonymousVolume)
 	}
 }

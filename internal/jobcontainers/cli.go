@@ -14,13 +14,18 @@ import (
 
 // commandTimeout bounds each docker command, so that a hung daemon delays
 // the end of a job instead of blocking it forever.
-const commandTimeout = 30 * time.Second
+const commandTimeout = 15 * time.Second
 
 // CLI reaches Docker by running the docker command, so it needs no socket
 // path or API version of its own.
 type CLI struct {
 	// Path is the docker command. Empty means "docker" on PATH.
 	Path string
+}
+
+func (c CLI) Containers(ctx context.Context) ([]string, error) {
+	out, err := c.run(ctx, commandTimeout, "ps", "--all", "--quiet", "--no-trunc")
+	return strings.Fields(string(out)), err
 }
 
 func (c CLI) RunningContainers(ctx context.Context) ([]string, error) {

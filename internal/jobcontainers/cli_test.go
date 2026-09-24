@@ -46,6 +46,13 @@ ps) printf 'aaa\nbbb\n' ;;
 network) printf 'n1\n' ;;
 esac
 `)
+	all, err := c.Containers(t.Context())
+	if err != nil {
+		t.Fatalf("c.Containers() error = %v", err)
+	}
+	if diff := cmp.Diff([]string{"aaa", "bbb"}, all); diff != "" {
+		t.Errorf("c.Containers() diff (-want +got):\n%s", diff)
+	}
 	running, err := c.RunningContainers(t.Context())
 	if err != nil {
 		t.Fatalf("c.RunningContainers() error = %v", err)
@@ -71,6 +78,7 @@ esac
 	}
 
 	want := []string{
+		"ps --all --quiet --no-trunc",
 		"ps --quiet --no-trunc",
 		"network ls --quiet --no-trunc",
 		"stop --time 10 aaa bbb",
