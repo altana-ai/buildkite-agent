@@ -93,7 +93,7 @@ func allGone(err error) bool {
 	if !errors.As(err, &cmdErr) {
 		return false
 	}
-	lines := strings.FieldsFunc(cmdErr.stderr, func(r rune) bool { return r == '\n' })
+	lines := strings.FieldsFunc(cmdErr.fullStderr, func(r rune) bool { return r == '\n' })
 	for _, line := range lines {
 		if !strings.Contains(line, "No such container") && !strings.Contains(line, "No such object") {
 			return false
@@ -120,13 +120,17 @@ func (c CLI) RemoveNetworks(ctx context.Context, ids []string) error {
 
 // commandError is a docker command that failed, with what it wrote to stderr.
 type commandError struct {
-	args   []string
-	err    error
-	stderr string
+	args       []string
+	err        error
+	fullStderr string
 }
 
 func (e *commandError) Error() string {
-	return fmt.Sprintf("docker %s: %v: %s", strings.Join(e.args, " "), e.err, e.stderr)
+	msg := e.fullStderr
+	if len(msg) > maxStderr {
+		msg = msg[:maxStderr] + "…"
+	}
+	return fmt.Sprintf("docker %s: %v: %s", strings.Join(e.args, " "), e.err, msg)
 }
 
 func (e *commandError) Unwrap() error { return e.err }
@@ -146,11 +150,7 @@ func (c CLI) run(ctx context.Context, timeout time.Duration, args ...string) ([]
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if len(msg) > maxStderr {
-			msg = msg[:maxStderr] + "…"
-		}
-		return stdout.Bytes(), &commandError{args: args[:min(len(args), 3)], err: err, stderr: msg}
+		return stdout.Bytes(), &commandError{args: args[:min(len(args), 3)], err: err, fullStderr: strings.TrimSpace(stderr.String())}
 	}
 	return stdout.Bytes(), nil
 }

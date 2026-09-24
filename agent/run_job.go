@@ -219,6 +219,16 @@ func (r *JobRunner) Run(ctx context.Context, ignoreAgentInDispatches *bool) (err
 	wg.Go(func() { r.jobCancellationChecker(cctx) })
 
 	r.snapshotContainers(ctx)
+	// A cancel during the snapshot finds no process to signal, so the
+	// bootstrap must not start after it.
+	if r.cancelled.Load() {
+		exit.Status = -1
+		exit.SignalReason = SignalReasonCancel
+		if r.agentStopping.Load() {
+			exit.SignalReason = SignalReasonAgentStop
+		}
+		return nil
+	}
 	exit = r.runJob(cctx)
 	// The defer mutates the error return in some cases.
 	return nil
