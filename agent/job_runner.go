@@ -21,6 +21,7 @@ import (
 	envutil "github.com/buildkite/agent/v3/env"
 	"github.com/buildkite/agent/v3/internal/experiments"
 	"github.com/buildkite/agent/v3/internal/jobcgroup"
+	"github.com/buildkite/agent/v3/internal/jobcontainers"
 	"github.com/buildkite/agent/v3/internal/process"
 	"github.com/buildkite/agent/v3/internal/shell"
 	"github.com/buildkite/agent/v3/kubernetes"
@@ -57,6 +58,9 @@ const (
 type JobRunnerConfig struct {
 	// The configuration of the agent from the CLI
 	AgentConfiguration AgentConfiguration
+
+	// The name the agent worker running the job registered with
+	AgentName string
 
 	// How often to check if the job has been cancelled
 	JobStatusInterval time.Duration
@@ -148,6 +152,10 @@ type JobRunner struct {
 
 	// jobCgroup is the job's cgroup, or nil if the job runs outside one.
 	jobCgroup *jobcgroup.Group
+
+	// containerSnapshot is the host's Docker state before the bootstrap
+	// started, or nil if Docker was not reached.
+	containerSnapshot *jobcontainers.Snapshot
 
 	// postExitLogs reaches every destination of jobLogs except the pipes
 	// that close when the bootstrap exits, at which point io.MultiWriter

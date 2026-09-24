@@ -4,6 +4,7 @@ package integration
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -75,8 +76,8 @@ func newScriptJobRunner(t *testing.T, server, jobID, dir, script string, conf ag
 }
 
 // newLoggedScriptJobRunner is newScriptJobRunner with the agent log going to
-// l and the agent's stdout to stdout.
-func newLoggedScriptJobRunner(t *testing.T, l logger.Logger, stdout io.Writer, server, jobID, dir, script string, conf agent.AgentConfiguration) *agent.JobRunner {
+// l and the agent's stdout to stdout. Each opt changes the runner's config.
+func newLoggedScriptJobRunner(t *testing.T, l logger.Logger, stdout io.Writer, server, jobID, dir, script string, conf agent.AgentConfiguration, opts ...func(*agent.JobRunnerConfig)) *agent.JobRunner {
 	t.Helper()
 
 	path := filepath.Join(dir, "bootstrap.sh")
@@ -85,7 +86,7 @@ func newLoggedScriptJobRunner(t *testing.T, l logger.Logger, stdout io.Writer, s
 	}
 	conf.BootstrapScript = "/bin/sh " + path
 
-	jr, err := agent.NewJobRunner(t.Context(), l, api.NewClient(l, api.Config{Endpoint: server, Token: "llamasrock"}), agent.JobRunnerConfig{
+	jrConf := agent.JobRunnerConfig{
 		Job: &api.Job{
 			ID:                 jobID,
 			ChunksMaxSizeBytes: 1024,
@@ -96,7 +97,11 @@ func newLoggedScriptJobRunner(t *testing.T, l logger.Logger, stdout io.Writer, s
 		AgentStdout:        stdout,
 		MetricsScope:       metrics.NewCollector(l, metrics.CollectorConfig{}).Scope(metrics.Tags{}),
 		JobStatusInterval:  1 * time.Second,
-	})
+	}
+	for _, opt := range opts {
+		opt(&jrConf)
+	}
+	jr, err := agent.NewJobRunner(t.Context(), l, api.NewClient(l, api.Config{Endpoint: server, Token: "llamasrock"}), jrConf)
 	if err != nil {
 		t.Fatalf("agent.NewJobRunner() error = %v", err)
 	}
@@ -337,6 +342,9 @@ func TestJobCgroup_JobRunsOutsideAGroupThatCannotBeCreated(t *testing.T) {
 			if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
 				t.Errorf("os.Stat(%q) error = %v, want it still missing", missing, err)
 			}
+			if got := ignoreInDispatches(t, e, "no-group-job"); (got != nil && *got) != wantTainted {
+				t.Errorf("finish.IgnoreAgentInDispatches = %v, want %t", ptrString(got), wantTainted)
+			}
 			select {
 			case <-m.Tainted():
 				if !wantTainted {
@@ -436,4 +444,29 @@ func TestJobCgroup_ReleasesTheGroupOfAJobThatNeverRuns(t *testing.T) {
 			assertNoJobGroups(t, m)
 		})
 	}
+}
+
+// ignoreInDispatches returns ignore_agent_in_dispatches from the job's only
+// finish request.
+func ignoreInDispatches(t *testing.T, e *testAgentEndpoint, jobID string) *bool {
+	t.Helper()
+	e.mtx.Lock()
+	defer e.mtx.Unlock()
+
+	calls := e.calls[fmt.Sprintf("/jobs/%s/finish", jobID)]
+	if len(calls) != 1 {
+		t.Fatalf("%d finish requests for %s, want 1", len(calls), jobID)
+	}
+	var finish api.JobFinishRequest
+	if err := json.Unmarshal(calls[0], &finish); err != nil {
+		t.Fatalf("decoding the finish request: %v", err)
+	}
+	return finish.IgnoreAgentInDispatches
+}
+
+func ptrString(b *bool) string {
+	if b == nil {
+		return "nil"
+	}
+	return strconv.FormatBool(*b)
 }

@@ -218,6 +218,17 @@ func (r *JobRunner) Run(ctx context.Context, ignoreAgentInDispatches *bool) (err
 	wg.Go(func() { r.streamJobLogsAfterProcessStart(cctx) })
 	wg.Go(func() { r.jobCancellationChecker(cctx) })
 
+	r.snapshotContainers(ctx)
+	// A cancel during the snapshot finds no process to signal, so the
+	// bootstrap must not start after it.
+	if r.cancelled.Load() {
+		exit.Status = -1
+		exit.SignalReason = SignalReasonCancel
+		if r.agentStopping.Load() {
+			exit.SignalReason = SignalReasonAgentStop
+		}
+		return nil
+	}
 	exit = r.runJob(cctx)
 	// The defer mutates the error return in some cases.
 	return nil
@@ -408,7 +419,13 @@ func (r *JobRunner) cleanup(ctx context.Context, wg *sync.WaitGroup, exit core.P
 	if mode != jobcgroup.ModeOff {
 		r.reportLeftoverProcesses()
 	}
-	if mode == jobcgroup.ModeEnforce && !r.killLeftovers() {
+	if mode == jobcgroup.ModeEnforce {
+		r.killLeftovers()
+	}
+	r.sweepContainers(ctx)
+	// Whatever tainted the agent, even a sibling worker's job, it is about to
+	// stop and must not be dispatched another job first.
+	if r.jobCgroupSetting() == jobcgroup.ModeEnforce && r.conf.AgentConfiguration.JobCgroup.IsTainted() {
 		ignoreAgentInDispatches = ptr.To(true)
 	}
 
