@@ -268,6 +268,57 @@ func TestKillReportsGroupThatDoesNotEmpty(t *testing.T) {
 	}
 }
 
+func TestKillFailsClosedWhenTheGroupCannotBeKilled(t *testing.T) {
+	t.Parallel()
+
+	// cgroup.kill as a directory makes the write fail, as EACCES would.
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "cgroup.kill"), 0o755); err != nil {
+		t.Fatalf("os.Mkdir(cgroup.kill) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.events"), []byte("populated 1\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(cgroup.events) error = %v", err)
+	}
+
+	if err := (&Group{path: dir}).Kill(time.Second); !errors.Is(err, ErrNotEmpty) {
+		t.Errorf("Kill() error = %v, want %v", err, ErrNotEmpty)
+	}
+}
+
+func TestKillingAGroupAnotherCallerRemovedIsNotAnError(t *testing.T) {
+	t.Parallel()
+
+	gone := filepath.Join(t.TempDir(), "gone")
+	if err := waitEmpty(gone, time.Second); err != nil {
+		t.Errorf("waitEmpty() error = %v, want nil", err)
+	}
+	if err := removeTree(gone); err != nil {
+		t.Errorf("removeTree() error = %v, want nil", err)
+	}
+	if err := (&Group{path: gone}).Kill(time.Second); err != nil {
+		t.Errorf("Kill() error = %v, want nil", err)
+	}
+}
+
+func TestKillExitedLeavesASubtreeWhoseAgentGroupHasProcesses(t *testing.T) {
+	t.Parallel()
+
+	// The owner is out of sight in /proc, as from another pid namespace,
+	// but its agent group still has a process.
+	parent := t.TempDir()
+	m := NewManager(ModeEnforce, filepath.Join(parent, ownerGroupPrefix+strconv.Itoa(os.Getpid())))
+	other := filepath.Join(parent, ownerGroupPrefix+strconv.Itoa(exitedAgentPID))
+	fakeStuckGroup(t, other)
+	fakeStuckGroup(t, filepath.Join(other, agentGroupName))
+
+	if err := m.killExited(parent, 50*time.Millisecond); err != nil {
+		t.Errorf("killExited() error = %v, want nil", err)
+	}
+	if kill, err := os.ReadFile(filepath.Join(other, "cgroup.kill")); err != nil || len(kill) > 0 {
+		t.Errorf("cgroup.kill = %q, %v, want the running agent's subtree left alone", kill, err)
+	}
+}
+
 // exitedAgentPID is above the kernel's largest pid, so no agent with it can
 // be running.
 const exitedAgentPID = 99999999

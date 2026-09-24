@@ -1243,10 +1243,7 @@ var AgentStartCommand = cli.Command{
 
 			select {
 			case <-agentConf.JobCgroup.Tainted():
-				// Exiting 0 before registering stops systemd restarting
-				// the agent onto a host that is about to be replaced.
-				l.Errorf("Not starting, because processes left by an earlier agent's job survived SIGKILL (job-cgroup=enforce)")
-				return nil
+				return refuseTaintedStart(l, cfg.AcquireJob)
 			default:
 			}
 		}
@@ -1544,6 +1541,20 @@ func (ps *poolSignals) exitNow() {
 // its job groups to empty. SIGKILL has already been sent to every process in
 // them by the time it starts waiting.
 const hardExitDrainTimeout = time.Second
+
+// refuseTaintedStart stops an agent before it registers, on a host where an
+// earlier agent's job left processes that could not be killed. It exits 0 so
+// that systemd does not restart the agent onto a host that is about to be
+// replaced, except with acquire-job, whose caller would read 0 as the job
+// having run and passed.
+func refuseTaintedStart(l logger.Logger, acquireJob string) error {
+	const msg = "not starting, because processes left by an earlier agent's job could not be killed (job-cgroup=enforce)"
+	if acquireJob != "" {
+		return errors.New(msg)
+	}
+	l.Errorf("%s", msg)
+	return nil
+}
 
 // killJobCgroups kills every job group the agent has created, as it exits.
 func killJobCgroups(l logger.Logger, m *jobcgroup.Manager, timeout time.Duration) {

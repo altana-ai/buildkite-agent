@@ -39,9 +39,7 @@ func (r *JobRunner) jobCgroupMode() jobcgroup.Mode {
 // reportLeftoverProcesses writes whatever is still running in the job's
 // cgroup to the job log, so it must run before the log's final flush.
 //
-// Messages after the bootstrap exits go to r.output, not r.jobLogs: the
-// header scanner's pipe in r.jobLogs closes when the process ends, and
-// io.MultiWriter drops the write at the first writer that fails.
+// Messages after the bootstrap exits go to r.postExitLogs, not r.jobLogs.
 func (r *JobRunner) reportLeftoverProcesses() {
 	procs, err := r.jobCgroup.Processes()
 	if err != nil {
@@ -62,8 +60,8 @@ func (r *JobRunner) reportLeftoverProcesses() {
 	if r.jobCgroupMode() == jobcgroup.ModeReport {
 		when = "after the job finishes"
 	}
-	_, _ = fmt.Fprintf(r.output, "~~~ ⚠️ %d processes outlived the job and will be killed %s\n", len(procs), when)
-	_, _ = fmt.Fprintln(r.output, strings.Join(lines, "\n"))
+	_, _ = fmt.Fprintf(r.postExitLogs, "~~~ ⚠️ %d processes outlived the job and will be killed %s\n", len(procs), when)
+	_, _ = fmt.Fprintln(r.postExitLogs, strings.Join(lines, "\n"))
 
 	r.agentLogger.WithFields(
 		logger.StringField("jobID", r.conf.Job.ID),
@@ -93,17 +91,17 @@ func (r *JobRunner) killLeftovers() bool {
 
 	case errors.Is(err, jobcgroup.ErrNotEmpty):
 		jobCgroupKillFailures.Inc()
-		r.agentLogger.Errorf("Job %s: %s still has processes %v after SIGKILL", r.conf.Job.ID, g.Path(), jobcgroup.DrainTimeout)
+		r.agentLogger.Errorf("Job %s: couldn't kill every process in %s within %v: %v", r.conf.Job.ID, g.Path(), jobcgroup.DrainTimeout, err)
 		if mode != jobcgroup.ModeEnforce {
 			return true
 		}
-		_, _ = fmt.Fprintf(r.output, "+++ ⛔ Processes left by this job survived SIGKILL for %v, so this agent will stop accepting jobs\n", jobcgroup.DrainTimeout)
+		_, _ = fmt.Fprintf(r.postExitLogs, "+++ ⛔ Processes left by this job could not all be killed within %v, so this agent will stop accepting jobs\n", jobcgroup.DrainTimeout)
 		r.conf.AgentConfiguration.JobCgroup.Taint()
 		return false
 
 	default:
-		// The group emptied, or its state is unreadable. Either way, a stuck
-		// process has not been shown, so this is not a reason to stop.
+		// The group emptied but could not be removed, so no process
+		// survived and this is not a reason to stop.
 		r.agentLogger.Warnf("[JobRunner] Couldn't kill and remove %s: %v", g.Path(), err)
 		return true
 	}
