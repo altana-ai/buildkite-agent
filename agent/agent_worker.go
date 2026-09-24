@@ -558,6 +558,7 @@ func (a *AgentWorker) RunJob(ctx context.Context, acceptResponse *api.Job, ignor
 		return fmt.Errorf("failed to initialize job: %w", err)
 	}
 	if !a.jobRunner.CompareAndSwap(nil, jr) {
+		jr.releaseJobCgroup()
 		return fmt.Errorf("agent worker already has a job running")
 	}
 	// No more job, no more runner.

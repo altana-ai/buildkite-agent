@@ -34,6 +34,7 @@ import (
 	gcpsigner "github.com/buildkite/agent/v3/internal/cryptosigner/gcp"
 	"github.com/buildkite/agent/v3/internal/experiments"
 	"github.com/buildkite/agent/v3/internal/job/hook"
+	"github.com/buildkite/agent/v3/internal/jobcgroup"
 	"github.com/buildkite/agent/v3/internal/osutil"
 	"github.com/buildkite/agent/v3/internal/process"
 	"github.com/buildkite/agent/v3/internal/shell"
@@ -121,6 +122,7 @@ type AgentStartConfig struct {
 	CancelGracePeriod          int    `cli:"cancel-grace-period"`
 	SignalGracePeriodSeconds   int    `cli:"signal-grace-period-seconds"`
 	ReflectExitStatus          bool   `cli:"reflect-exit-status"`
+	JobCgroup                  string `cli:"job-cgroup"`
 
 	EnableJobLogTmpfile bool   `cli:"enable-job-log-tmpfile"`
 	JobLogPath          string `cli:"job-log-path" normalize:"filepath"`
@@ -425,6 +427,12 @@ var AgentStartCommand = cli.Command{
 			EnvVar: "BUILDKITE_AGENT_DISCONNECT_AFTER_UPTIME",
 		},
 		cancelGracePeriodFlag,
+		cli.StringFlag{
+			Name:   "job-cgroup",
+			Value:  "off",
+			Usage:  "Run each job in its own cgroup v2 group and kill whatever it leaves running before the next job, even processes that left the job's process group. One of ′off′, ′report′ (kill after the job's result is reported) or ′enforce′ (kill before the job is marked finished, and stop accepting jobs if any process survives). Linux only, and the agent's own cgroup must be delegated to it, for example with systemd ′Delegate=pids′",
+			EnvVar: "BUILDKITE_JOB_CGROUP",
+		},
 		cli.BoolFlag{
 			Name:   "enable-job-log-tmpfile",
 			Usage:  "Store the job logs in a temporary file ′BUILDKITE_JOB_LOG_TMPFILE′ that is accessible during the job and removed at the end of the job (default: false)",
@@ -993,6 +1001,11 @@ var AgentStartCommand = cli.Command{
 			return fmt.Errorf("while parsing trace context encoding: %v", err)
 		}
 
+		jobCgroupMode, err := jobcgroup.ParseMode(cfg.JobCgroup)
+		if err != nil {
+			return err
+		}
+
 		mc := metrics.NewCollector(l, metrics.CollectorConfig{
 			Datadog:              cfg.MetricsDatadog,
 			DatadogHost:          cfg.MetricsDatadogHost,
@@ -1221,6 +1234,20 @@ var AgentStartCommand = cli.Command{
 			l.Infof("Agents will disconnect after a job run has completed")
 		}
 
+		if jobCgroupMode != jobcgroup.ModeOff && cfg.KubernetesExec {
+			l.Warnf("job-cgroup=%s has no effect with kubernetes-exec, which runs jobs in other containers", jobCgroupMode)
+		} else if agentConf.JobCgroup = jobcgroup.Setup(l, jobCgroupMode); agentConf.JobCgroup != nil {
+			// The stack's unit may use KillMode=process, in which case
+			// systemd leaves job groups running after the agent exits.
+			defer killJobCgroups(l, agentConf.JobCgroup, jobcgroup.DrainTimeout)
+
+			select {
+			case <-agentConf.JobCgroup.Tainted():
+				return refuseTaintedStart(l, cfg.AcquireJob)
+			default:
+			}
+		}
+
 		if agentConf.DisconnectAfterIdleTimeout > 0 {
 			l.Infof("Agents will disconnect after %v of inactivity", agentConf.DisconnectAfterIdleTimeout)
 		}
@@ -1412,6 +1439,11 @@ var AgentStartCommand = cli.Command{
 			// Under Kubernetes, there is no user interactively signalling us,
 			// so on SIGTERM, stop un-gracefully.
 			skipGraceful: cfg.KubernetesExec,
+			exit:         os.Exit,
+		}
+		if m := agentConf.JobCgroup; m != nil {
+			// os.Exit skips the deferred kill above.
+			poolSigs.beforeExit = func() { killJobCgroups(l, m, hardExitDrainTimeout) }
 		}
 		signals := poolSigs.handle(ctx)
 		defer close(signals)
@@ -1491,6 +1523,44 @@ type poolSignals struct {
 	pool              *agent.AgentPool
 	cancelGracePeriod time.Duration
 	skipGraceful      bool
+
+	// beforeExit, if set, runs just before the agent exits without
+	// returning from its command.
+	beforeExit func()
+	exit       func(code int)
+}
+
+func (ps *poolSignals) exitNow() {
+	if ps.beforeExit != nil {
+		ps.beforeExit()
+	}
+	ps.exit(1)
+}
+
+// hardExitDrainTimeout bounds how long an agent exiting immediately waits for
+// its job groups to empty. SIGKILL has already been sent to every process in
+// them by the time it starts waiting.
+const hardExitDrainTimeout = time.Second
+
+// refuseTaintedStart stops an agent before it registers, on a host where an
+// earlier agent's job left processes that could not be killed. It exits 0 so
+// that systemd does not restart the agent onto a host that is about to be
+// replaced, except with acquire-job, whose caller would read 0 as the job
+// having run and passed.
+func refuseTaintedStart(l logger.Logger, acquireJob string) error {
+	const msg = "not starting, because processes left by an earlier agent's job could not be killed (job-cgroup=enforce)"
+	if acquireJob != "" {
+		return errors.New(msg)
+	}
+	l.Errorf("%s", msg)
+	return nil
+}
+
+// killJobCgroups kills every job group the agent has created, as it exits.
+func killJobCgroups(l logger.Logger, m *jobcgroup.Manager, timeout time.Duration) {
+	if err := m.KillAll(timeout); err != nil {
+		l.Errorf("Couldn't kill every job cgroup on exit: %v", err)
+	}
 }
 
 func (ps *poolSignals) handle(ctx context.Context) chan os.Signal {
@@ -1529,7 +1599,7 @@ func (ps *poolSignals) handleLoop(ctx context.Context, signals chan os.Signal) {
 			time.Sleep(ps.cancelGracePeriod + 1*time.Second)
 			// We get here if the main goroutine hasn't returned yet.
 			ps.log.Infof("Timed out waiting for agents to exit; exiting immediately with status 1")
-			os.Exit(1)
+			ps.exitNow()
 		}()
 	}
 
@@ -1557,7 +1627,7 @@ func (ps *poolSignals) handleLoop(ctx context.Context, signals chan os.Signal) {
 
 			case 3:
 				ps.log.Infof("Exiting immediately with status 1")
-				os.Exit(1)
+				ps.exitNow()
 			}
 
 		default:
