@@ -161,13 +161,14 @@ func (m *Manager) jobGroups() ([]string, error) {
 // process has exited, and any job groups already in m's own subtree. A group
 // whose processes survive is kept, and in enforce mode taints m, because a
 // job's processes have survived SIGKILL on this host just as if one of m's
-// own jobs had left them.
+// own jobs had left them. So does a failure to list what to kill.
 func (m *Manager) killExited(parent string, timeout time.Duration) error {
+	var paths []string
+	var listErrs []error
 	entries, err := os.ReadDir(parent)
 	if err != nil {
-		return err
+		listErrs = append(listErrs, err)
 	}
-	var paths []string
 	for _, e := range entries {
 		path := filepath.Join(parent, e.Name())
 		pid, ok := ownerPID(e)
@@ -179,7 +180,7 @@ func (m *Manager) killExited(parent string, timeout time.Duration) error {
 			// its container would be.
 			own, err := m.jobGroups()
 			if err != nil {
-				return err
+				listErrs = append(listErrs, err)
 			}
 			paths = append(paths, own...)
 		case !ownerRunning(parent, pid):
@@ -188,12 +189,14 @@ func (m *Manager) killExited(parent string, timeout time.Duration) error {
 	}
 
 	errs := killGroups(paths, timeout)
+	tainted := len(listErrs) > 0
 	for _, err := range errs {
-		if errors.Is(err, ErrNotEmpty) && m.mode == ModeEnforce {
-			m.Taint()
-		}
+		tainted = tainted || errors.Is(err, ErrNotEmpty)
 	}
-	return joinErrors(paths, errs)
+	if tainted && m.mode == ModeEnforce {
+		m.Taint()
+	}
+	return errors.Join(append(listErrs, joinErrors(paths, errs))...)
 }
 
 // killGroups kills every group at once, then waits for them against one
@@ -254,21 +257,17 @@ func ownerPID(e fs.DirEntry) (int, bool) {
 	return pid, err == nil && pid > 0
 }
 
-// ownerRunning reports whether the agent with pid may still be running.
-// Killing a running agent's subtree kills its jobs, so any doubt counts as
-// running.
+// ownerRunning reports whether the agent with pid may still be running: its
+// process is in parent, about to move, or in its subtree's agent group. A
+// later process that reuses the pid is elsewhere. Other processes in the
+// agent group do not count, since an agent killed outright can leave ones it
+// started there.
+//
+// Agents that share a cgroup must share a pid namespace, so that each can see
+// the others in /proc. Any doubt other than a missing process counts as
+// running, since killing a running agent's subtree kills its jobs.
 func ownerRunning(parent string, pid int) bool {
 	agentGroup := filepath.Join(parent, ownerGroupPrefix+strconv.Itoa(pid), agentGroupName)
-
-	// A process in the agent group may be the owner even where /proc does
-	// not show it, as when it is in another pid namespace.
-	populated, err := isPopulated(agentGroup)
-	if populated || err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return true
-	}
-
-	// Otherwise the owner can only be in parent, about to move. A later
-	// process that reuses the pid is elsewhere.
 	own, err := cgroupOf(strconv.Itoa(pid))
 	if err != nil {
 		return !errors.Is(err, fs.ErrNotExist)

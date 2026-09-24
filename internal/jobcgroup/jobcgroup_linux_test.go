@@ -300,22 +300,62 @@ func TestKillingAGroupAnotherCallerRemovedIsNotAnError(t *testing.T) {
 	}
 }
 
-func TestKillExitedLeavesASubtreeWhoseAgentGroupHasProcesses(t *testing.T) {
+func TestKillExitedKillsAnExitedAgentsSubtreeWithProcessesInItsAgentGroup(t *testing.T) {
 	t.Parallel()
 
-	// The owner is out of sight in /proc, as from another pid namespace,
-	// but its agent group still has a process.
-	parent := t.TempDir()
-	m := NewManager(ModeEnforce, filepath.Join(parent, ownerGroupPrefix+strconv.Itoa(os.Getpid())))
-	other := filepath.Join(parent, ownerGroupPrefix+strconv.Itoa(exitedAgentPID))
-	fakeStuckGroup(t, other)
-	fakeStuckGroup(t, filepath.Join(other, agentGroupName))
-
-	if err := m.killExited(parent, 50*time.Millisecond); err != nil {
-		t.Errorf("killExited() error = %v, want nil", err)
+	// An agent killed outright leaves behind a job's process, and one it
+	// started itself, such as a hook's daemon, in its agent group.
+	parent := testManager(t, ModeEnforce).Root()
+	exited := &Manager{root: filepath.Join(parent, ownerGroupPrefix+strconv.Itoa(exitedAgentPID))}
+	if err := os.Mkdir(exited.root, 0o755); err != nil {
+		t.Fatalf("os.Mkdir(%q) error = %v", exited.root, err)
 	}
-	if kill, err := os.ReadFile(filepath.Join(other, "cgroup.kill")); err != nil || len(kill) > 0 {
-		t.Errorf("cgroup.kill = %q, %v, want the running agent's subtree left alone", kill, err)
+	var pids []int
+	for _, name := range []string{agentGroupName, jobGroupPrefix + "left"} {
+		g, err := exited.create(name)
+		if err != nil {
+			t.Fatalf("create(%q) error = %v", name, err)
+		}
+		startInGroup(t, g, `setsid nohup sleep 310 >/dev/null 2>&1 &`)
+		pids = append(pids, awaitNames(t, g, "sleep")[0].PID)
+		g.Close() //nolint:errcheck // Test cleanup.
+	}
+
+	m := NewManager(ModeEnforce, filepath.Join(parent, ownerGroupPrefix+strconv.Itoa(os.Getpid())))
+	if err := m.killExited(parent, DrainTimeout); err != nil {
+		t.Fatalf("killExited() error = %v", err)
+	}
+	for _, pid := range pids {
+		awaitDead(t, pid)
+	}
+	if _, err := os.Stat(exited.root); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("os.Stat(%q) error = %v, want the exited agent's subtree removed", exited.root, err)
+	}
+}
+
+func TestKillExitedTaintsEnforceWhenItCannotListGroups(t *testing.T) {
+	t.Parallel()
+
+	for mode, wantTainted := range map[Mode]bool{ModeEnforce: true, ModeReport: false} {
+		t.Run(string(mode), func(t *testing.T) {
+			t.Parallel()
+
+			missing := filepath.Join(t.TempDir(), "missing")
+			m := NewManager(mode, filepath.Join(missing, ownerGroupPrefix+strconv.Itoa(os.Getpid())))
+			if err := m.killExited(missing, time.Second); err == nil {
+				t.Error("killExited() error = nil, want the listing error")
+			}
+			select {
+			case <-m.Tainted():
+				if !wantTainted {
+					t.Error("the manager is tainted, want it untainted in report mode")
+				}
+			default:
+				if wantTainted {
+					t.Error("the manager is not tainted, want it tainted in enforce mode")
+				}
+			}
+		})
 	}
 }
 

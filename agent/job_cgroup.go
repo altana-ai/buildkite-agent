@@ -51,10 +51,7 @@ func (r *JobRunner) reportLeftoverProcesses() {
 	}
 	jobCgroupLeftoverProcesses.Add(float64(len(procs)))
 
-	lines := make([]string, 0, len(procs))
-	for _, p := range procs {
-		lines = append(lines, fmt.Sprintf("pid=%d ppid=%d name=%q", p.PID, p.PPID, p.Name))
-	}
+	lines := leftoverLines(procs)
 
 	when := "now"
 	if r.jobCgroupMode() == jobcgroup.ModeReport {
@@ -68,6 +65,23 @@ func (r *JobRunner) reportLeftoverProcesses() {
 		logger.IntField("count", len(procs)),
 		logger.StringField("leftover_processes", strings.Join(lines, "; ")),
 	).Warnf("Job left processes running after its bootstrap exited")
+}
+
+// maxLeftoverLines bounds the report, since a job that leaks a worker pool
+// or a fork bomb can leave thousands of processes. The count is always exact.
+const maxLeftoverLines = 50
+
+// leftoverLines describes each leftover process on its own line, up to
+// maxLeftoverLines, then says how many more there are.
+func leftoverLines(procs []jobcgroup.Process) []string {
+	lines := make([]string, 0, min(len(procs), maxLeftoverLines)+1)
+	for _, p := range procs[:min(len(procs), maxLeftoverLines)] {
+		lines = append(lines, fmt.Sprintf("pid=%d ppid=%d name=%q", p.PID, p.PPID, p.Name))
+	}
+	if more := len(procs) - maxLeftoverLines; more > 0 {
+		lines = append(lines, fmt.Sprintf("and %d more", more))
+	}
+	return lines
 }
 
 // killLeftovers kills everything the job left running, then removes and

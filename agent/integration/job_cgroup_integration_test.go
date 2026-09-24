@@ -314,23 +314,40 @@ while :; do sleep 0.1; done
 func TestJobCgroup_JobRunsOutsideAGroupThatCannotBeCreated(t *testing.T) {
 	t.Parallel()
 
-	e := createTestAgentEndpoint()
-	server := e.server()
-	defer server.Close()
+	// The job still runs, but nothing will kill what it leaves, so enforce
+	// mode takes no more jobs.
+	for mode, wantTainted := range map[jobcgroup.Mode]bool{jobcgroup.ModeEnforce: true, jobcgroup.ModeReport: false} {
+		t.Run(string(mode), func(t *testing.T) {
+			t.Parallel()
 
-	missing := filepath.Join(t.TempDir(), "missing")
-	dir := t.TempDir()
-	jr := newScriptJobRunner(t, server.URL, "no-group-job", dir, "echo ran\n", agent.AgentConfiguration{
-		JobCgroup: jobcgroup.NewManager(jobcgroup.ModeEnforce, missing),
-	})
-	if err := jr.Run(t.Context(), nil); err != nil {
-		t.Fatalf("jr.Run() error = %v", err)
-	}
-	if got, want := e.finishesFor(t, "no-group-job")[0].ExitStatus, "0"; got != want {
-		t.Errorf("finish.ExitStatus = %q, want %q", got, want)
-	}
-	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("os.Stat(%q) error = %v, want it still missing", missing, err)
+			e := createTestAgentEndpoint()
+			server := e.server()
+			defer server.Close()
+
+			missing := filepath.Join(t.TempDir(), "missing")
+			m := jobcgroup.NewManager(mode, missing)
+			dir := t.TempDir()
+			jr := newScriptJobRunner(t, server.URL, "no-group-job", dir, "echo ran\n", agent.AgentConfiguration{JobCgroup: m})
+			if err := jr.Run(t.Context(), nil); err != nil {
+				t.Fatalf("jr.Run() error = %v", err)
+			}
+			if got, want := e.finishesFor(t, "no-group-job")[0].ExitStatus, "0"; got != want {
+				t.Errorf("finish.ExitStatus = %q, want %q", got, want)
+			}
+			if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("os.Stat(%q) error = %v, want it still missing", missing, err)
+			}
+			select {
+			case <-m.Tainted():
+				if !wantTainted {
+					t.Error("the manager is tainted, want it untainted in report mode")
+				}
+			default:
+				if wantTainted {
+					t.Error("the manager is not tainted, want it tainted in enforce mode")
+				}
+			}
+		})
 	}
 }
 
