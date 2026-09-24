@@ -391,6 +391,11 @@ func NewJobRunner(ctx context.Context, l logger.Logger, apiClient *api.Client, c
 			g, err := m.Create(conf.Job.ID)
 			if err != nil {
 				r.agentLogger.Warnf("[JobRunner] Job %s will run outside a job cgroup: %v", conf.Job.ID, err)
+				// Nothing will kill what this job leaves behind, so enforce
+				// mode takes no more jobs after it.
+				if m.Mode() == jobcgroup.ModeEnforce {
+					m.Taint()
+				}
 			} else {
 				r.jobCgroup = g
 				procConf.UseCgroupFD = true
