@@ -14,7 +14,8 @@ import (
 )
 
 // fakeCLI returns a CLI whose docker command is script, run by sh after it
-// appends its arguments to the returned file.
+// appends its arguments to the returned file. Its tests aren't parallel, since
+// a fork elsewhere while the script is open for writing fails its exec.
 func fakeCLI(t *testing.T, script string) (CLI, string) {
 	t.Helper()
 
@@ -39,7 +40,6 @@ func readArgs(t *testing.T, path string) []string {
 }
 
 func TestCLI_Commands(t *testing.T) {
-	t.Parallel()
 
 	c, args := fakeCLI(t, `
 case "$1" in
@@ -109,7 +109,6 @@ const inspectOutput = `[
 ]`
 
 func TestCLI_Inspect(t *testing.T) {
-	t.Parallel()
 
 	c, args := fakeCLI(t, "cat <<'EOF'\n"+inspectOutput+"\nEOF\n")
 	got, err := c.Inspect(t.Context(), []string{"aaa"})
@@ -133,7 +132,6 @@ func TestCLI_Inspect(t *testing.T) {
 
 // Docker exits 1 when any container has gone, but still describes the rest.
 func TestCLI_InspectToleratesContainersThatHaveGone(t *testing.T) {
-	t.Parallel()
 
 	for name, test := range map[string]struct {
 		stdout  string
@@ -146,7 +144,6 @@ func TestCLI_InspectToleratesContainersThatHaveGone(t *testing.T) {
 		"many gone": {stdout: inspectOutput, gone: 40, wantIDs: []string{"aaa"}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			t.Parallel()
 
 			c, _ := fakeCLI(t, "cat <<'EOF'\n"+test.stdout+"\nEOF\n"+
 				"i=0; while [ $i -lt "+strconv.Itoa(test.gone)+" ]; do "+
@@ -168,7 +165,6 @@ func TestCLI_InspectToleratesContainersThatHaveGone(t *testing.T) {
 }
 
 func TestCLI_Errors(t *testing.T) {
-	t.Parallel()
 
 	for name, script := range map[string]string{
 		"daemon down": "echo 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock' >&2\nexit 1\n",
@@ -179,7 +175,6 @@ func TestCLI_Errors(t *testing.T) {
 		"failure without a message": "echo '[]'\nexit 1\n",
 	} {
 		t.Run(name, func(t *testing.T) {
-			t.Parallel()
 
 			c, _ := fakeCLI(t, script)
 			if got, err := c.Inspect(t.Context(), []string{"aaa", "bbb"}); err == nil {
@@ -196,7 +191,6 @@ func TestCLI_Errors(t *testing.T) {
 }
 
 func TestCLI_MissingCommand(t *testing.T) {
-	t.Parallel()
 
 	c := CLI{Path: filepath.Join(t.TempDir(), "no-docker-here")}
 	if _, err := c.RunningContainers(t.Context()); err == nil {
