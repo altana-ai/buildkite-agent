@@ -5,6 +5,7 @@ package jobcontainers
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -136,16 +137,21 @@ func TestCLI_InspectToleratesContainersThatHaveGone(t *testing.T) {
 
 	for name, test := range map[string]struct {
 		stdout  string
+		gone    int
 		wantIDs []string
 	}{
-		"some gone": {stdout: inspectOutput, wantIDs: []string{"aaa"}},
-		"all gone":  {stdout: "[]", wantIDs: nil},
+		"some gone": {stdout: inspectOutput, gone: 1, wantIDs: []string{"aaa"}},
+		"all gone":  {stdout: "[]", gone: 1, wantIDs: nil},
+		// Enough to overflow maxStderr, as when a compose project exits.
+		"many gone": {stdout: inspectOutput, gone: 40, wantIDs: []string{"aaa"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
 			c, _ := fakeCLI(t, "cat <<'EOF'\n"+test.stdout+"\nEOF\n"+
-				"echo 'Error response from daemon: No such container: bbb' >&2\nexit 1\n")
+				"i=0; while [ $i -lt "+strconv.Itoa(test.gone)+" ]; do "+
+				"echo \"Error response from daemon: No such container: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd$i\" >&2; "+
+				"i=$((i+1)); done\nexit 1\n")
 			got, err := c.Inspect(t.Context(), []string{"aaa", "bbb"})
 			if err != nil {
 				t.Fatalf("c.Inspect() error = %v", err)

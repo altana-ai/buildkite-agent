@@ -34,6 +34,9 @@ type jobDocker struct {
 	// listErr is returned by every listing after the snapshot.
 	listErr error
 
+	// onSnapshot runs while the snapshot is being taken.
+	onSnapshot func()
+
 	mu      sync.Mutex
 	removed []string
 	calls   int
@@ -64,6 +67,9 @@ func (d *jobDocker) RunningContainers(context.Context) ([]string, error) {
 }
 
 func (d *jobDocker) Containers(ctx context.Context) ([]string, error) {
+	if d.onSnapshot != nil {
+		d.onSnapshot()
+	}
 	return d.RunningContainers(ctx)
 }
 
@@ -339,4 +345,40 @@ func TestJobCgroup_OffLeavesContainersAlone(t *testing.T) {
 	if d.calls != 0 || len(d.removed) != 0 {
 		t.Errorf("docker calls = %d, removed = %q, want Docker untouched", d.calls, d.removed)
 	}
+}
+
+// A cancel that arrives while Docker is slow to answer the snapshot finds no
+// process to signal, so the bootstrap must not start after it.
+func TestJobCgroup_CancelDuringTheContainerSnapshot(t *testing.T) {
+	t.Parallel()
+
+	m := testJobCgroup(t, jobcgroup.ModeEnforce)
+	e := createTestAgentEndpoint()
+	server := e.server()
+	defer server.Close()
+
+	dir := t.TempDir()
+	d := &jobDocker{dir: dir, container: leakedContainer()}
+	jr := newScriptJobRunner(t, server.URL, "cancelled-in-snapshot", dir, `touch "$DIR/ran"`+"\n", agent.AgentConfiguration{
+		JobCgroup:         m,
+		JobContainers:     jobcontainers.New(d, false),
+		SignalGracePeriod: 100 * time.Millisecond,
+	})
+	d.onSnapshot = func() {
+		if err := jr.Cancel(agent.CancelReasonJobState); err != nil {
+			t.Errorf("jr.Cancel() error = %v", err)
+		}
+	}
+	if err := jr.Run(t.Context(), nil); err != nil {
+		t.Fatalf("jr.Run() error = %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "ran")); err == nil {
+		t.Error("the bootstrap ran after the job was cancelled")
+	}
+	finish := e.finishesFor(t, "cancelled-in-snapshot")[0]
+	if got, want := finish.SignalReason, "cancel"; got != want {
+		t.Errorf("finish.SignalReason = %q, want %q", got, want)
+	}
+	assertNoJobGroups(t, m)
 }
