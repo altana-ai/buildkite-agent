@@ -13,10 +13,12 @@ import (
 	"github.com/google/go-cmp/cmp"
 )
 
-// fakeDocker is a daemon whose containers are all running.
+// fakeDocker is a daemon whose containers are all running, except the
+// stopped ones.
 type fakeDocker struct {
 	mu         sync.Mutex
 	containers map[string]Container
+	stopped    map[string]bool
 	networks   []string
 
 	// stuck containers survive being removed.
@@ -31,7 +33,7 @@ func (f *fakeDocker) record(call string, ids []string) {
 	f.calls = append(f.calls, call+" "+strings.Join(ids, ","))
 }
 
-func (f *fakeDocker) RunningContainers(context.Context) ([]string, error) {
+func (f *fakeDocker) list(all bool) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.listErr != nil {
@@ -39,11 +41,17 @@ func (f *fakeDocker) RunningContainers(context.Context) ([]string, error) {
 	}
 	ids := make([]string, 0, len(f.containers))
 	for id := range f.containers {
-		ids = append(ids, id)
+		if all || !f.stopped[id] {
+			ids = append(ids, id)
+		}
 	}
 	slices.Sort(ids)
 	return ids, nil
 }
+
+func (f *fakeDocker) Containers(context.Context) ([]string, error) { return f.list(true) }
+
+func (f *fakeDocker) RunningContainers(context.Context) ([]string, error) { return f.list(false) }
 
 func (f *fakeDocker) Inspect(_ context.Context, ids []string) ([]Container, error) {
 	f.mu.Lock()
@@ -112,16 +120,19 @@ const buildDir = "/var/lib/buildkite-agent/builds/agent-1"
 
 var testJob = Job{ID: "job-1", BuildDir: buildDir}
 
-func TestLeftovers_OneAgentTakesEveryContainerStartedDuringTheJob(t *testing.T) {
+func TestLeftovers_OneAgentTakesEveryContainerCreatedDuringTheJob(t *testing.T) {
 	t.Parallel()
 
-	f := &fakeDocker{}
-	f.start(Container{ID: "before", Name: "service", Image: "redis"})
+	f := &fakeDocker{stopped: map[string]bool{"stopped-before": true}}
+	f.start(Container{ID: "before", Name: "service", Image: "redis"}, Container{ID: "stopped-before"})
 	s := New(f, false)
 	snap, err := s.Snapshot(t.Context())
 	if err != nil {
 		t.Fatalf("s.Snapshot() error = %v", err)
 	}
+	// A container that existed before the job, such as a host service in
+	// restart backoff, is not the job's even if it starts during it.
+	delete(f.stopped, "stopped-before")
 	f.start(
 		Container{ID: "unlabelled", Name: "itest-db", Image: "postgres:16"},
 		Container{ID: "other-job", Name: "x", Image: "alpine", Labels: map[string]string{"com.buildkite.job-id": "job-2"}},
@@ -132,8 +143,8 @@ func TestLeftovers_OneAgentTakesEveryContainerStartedDuringTheJob(t *testing.T) 
 		t.Fatalf("s.Leftovers() error = %v", err)
 	}
 	want := []Leftover{
-		{ID: "other-job", Name: "x", Image: "alpine", Reason: ReasonStartedDuringJob},
-		{ID: "unlabelled", Name: "itest-db", Image: "postgres:16", Reason: ReasonStartedDuringJob},
+		{ID: "other-job", Name: "x", Image: "alpine", Reason: ReasonCreatedDuringJob},
+		{ID: "unlabelled", Name: "itest-db", Image: "postgres:16", Reason: ReasonCreatedDuringJob},
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("s.Leftovers() diff (-want +got):\n%s", diff)
@@ -144,6 +155,8 @@ func TestLeftovers_SharedHostTakesOnlyTheJobsContainers(t *testing.T) {
 	t.Parallel()
 
 	f := &fakeDocker{}
+	// An earlier job on this worker left it, so it is not this job's.
+	f.start(Container{ID: "earlier-job", BindSources: []string{buildDir + "/org/pipeline"}})
 	s := New(f, true)
 	snap, err := s.Snapshot(t.Context())
 	if err != nil {

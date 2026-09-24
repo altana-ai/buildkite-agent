@@ -43,11 +43,9 @@ func (r *JobRunner) snapshotContainers(ctx context.Context) {
 	r.containerSnapshot = snap
 }
 
-// sweepContainers reports the Docker containers the job left running and, in
-// enforce mode, removes them along with any networks the job created. If
-// they can't all be removed, it taints the manager so the agent stops
-// accepting jobs. It writes to the job log, so it must run before the log's
-// final flush.
+// sweepContainers reports the containers the job left running and, in enforce
+// mode, removes them and the job's networks, tainting the manager if any
+// survive. It writes to the job log, so it must run before the final flush.
 func (r *JobRunner) sweepContainers(ctx context.Context) {
 	s, snap, mode := r.conf.AgentConfiguration.JobContainers, r.containerSnapshot, r.jobCgroupSetting()
 	if s == nil || snap == nil || mode == jobcgroup.ModeOff {

@@ -30,7 +30,7 @@ var ErrNotRemoved = errors.New("job containers still running after being removed
 type Reason string
 
 const (
-	ReasonStartedDuringJob Reason = "started during the job"
+	ReasonCreatedDuringJob Reason = "created during the job"
 	ReasonJobLabel         Reason = "job label"
 	ReasonBindMount        Reason = "bind mount in the agent's build dir"
 	ReasonComposeDir       Reason = "compose working dir in the agent's build dir"
@@ -63,13 +63,15 @@ type Leftover struct {
 
 // Docker is the part of the Docker API that the sweeper uses.
 type Docker interface {
+	// Containers returns the IDs of every container, running or not.
+	Containers(ctx context.Context) ([]string, error)
+
 	// RunningContainers returns the IDs of every running container.
 	RunningContainers(ctx context.Context) ([]string, error)
 
 	// Inspect describes the containers among ids that still exist.
 	Inspect(ctx context.Context, ids []string) ([]Container, error)
 
-	// Networks returns the IDs of every network.
 	Networks(ctx context.Context) ([]string, error)
 
 	// Stop sends each container SIGTERM, and SIGKILL after timeout.
@@ -90,9 +92,7 @@ type Job struct {
 	BuildDir string
 }
 
-// Sweeper finds and removes a job's leftover containers. How it tells which
-// containers are the job's depends on whether the agent shares its host with
-// other agents' jobs.
+// Sweeper finds and removes a job's leftover containers.
 type Sweeper struct {
 	docker Docker
 	shared bool
@@ -100,8 +100,8 @@ type Sweeper struct {
 	warnOnce sync.Once
 }
 
-// New returns a Sweeper. shared is whether other agents run jobs on this
-// host at the same time, as when the agent spawns several workers.
+// New returns a Sweeper. shared is whether other workers run jobs on this
+// host at the same time, which decides how it tells the job's containers.
 func New(docker Docker, shared bool) *Sweeper {
 	return &Sweeper{docker: docker, shared: shared}
 }
@@ -112,10 +112,10 @@ type Snapshot struct {
 	networks   map[string]bool
 }
 
-// Snapshot records the running containers and the networks, so that on a
-// host with one agent, whatever appears later is the job's.
+// Snapshot records every container and network, so that containers the job
+// did not create are never taken for its own, even if they start during it.
 func (s *Sweeper) Snapshot(ctx context.Context) (*Snapshot, error) {
-	containers, err := s.docker.RunningContainers(ctx)
+	containers, err := s.docker.Containers(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -139,20 +139,15 @@ func (s *Sweeper) WarnUnavailable(l logger.Logger, err error) {
 	}
 }
 
-// Leftovers returns the job's containers that are still running.
-//
-// With one agent on the host, every container started since snap is the
-// job's. On a shared host, only containers tied to this job by a label or a
-// path in its build dir are, and the rest are left for the host's own
-// cleanup.
+// Leftovers returns the running containers created since snap that are the
+// job's. With one agent on the host, all of them are. On a shared host, only
+// those tied to this job by a label or a path in its build dir are.
 func (s *Sweeper) Leftovers(ctx context.Context, snap *Snapshot, job Job) ([]Leftover, error) {
 	running, err := s.docker.RunningContainers(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if !s.shared {
-		running = slices.DeleteFunc(running, func(id string) bool { return snap.containers[id] })
-	}
+	running = slices.DeleteFunc(running, func(id string) bool { return snap.containers[id] })
 	if len(running) == 0 {
 		return nil, nil
 	}
@@ -163,7 +158,7 @@ func (s *Sweeper) Leftovers(ctx context.Context, snap *Snapshot, job Job) ([]Lef
 	}
 	var leftovers []Leftover
 	for _, c := range containers {
-		reason := ReasonStartedDuringJob
+		reason := ReasonCreatedDuringJob
 		if s.shared {
 			var ok bool
 			if reason, ok = jobsOwn(c, job); !ok {
@@ -211,9 +206,8 @@ func (s *Sweeper) Remove(ctx context.Context, leftovers []Leftover) error {
 		ids = append(ids, c.ID)
 	}
 
-	// Another job may still be using what these containers share with it,
-	// such as a volume or a compose project, so they get the chance to exit
-	// cleanly first.
+	// Another job may share a volume or compose project with these, so they
+	// get the chance to exit cleanly first.
 	var stopErr error
 	if s.shared {
 		stopErr = s.docker.Stop(ctx, ids, StopTimeout)
