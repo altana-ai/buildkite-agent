@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/buildkite/agent/v3/internal/jobcgroup"
 	"github.com/buildkite/agent/v3/internal/systemdnotify"
 	"github.com/buildkite/agent/v3/logger"
 	"github.com/buildkite/agent/v3/status"
@@ -22,6 +23,7 @@ type AgentPool struct {
 	workers     []*AgentWorker
 	idleTimeout time.Duration
 	watchdog    watchdogNotifier
+	jobCgroup   *jobcgroup.Manager
 }
 
 // NewAgentPool returns a new AgentPool.
@@ -35,6 +37,7 @@ func NewAgentPool(workers []*AgentWorker, config *AgentConfiguration) (*AgentPoo
 		workers:     workers,
 		idleTimeout: config.DisconnectAfterIdleTimeout,
 		watchdog:    watchdog,
+		jobCgroup:   config.JobCgroup,
 	}, nil
 }
 
@@ -100,6 +103,21 @@ func (r *AgentPool) Start(ctx context.Context) error {
 	}
 
 	setStat("✅ Workers spawned!")
+
+	// A process that survives SIGKILL leaves the host in a state no later
+	// job should inherit, so every worker stops, not only the one that ran
+	// the job.
+	if r.jobCgroup != nil && r.jobCgroup.Mode() == jobcgroup.ModeEnforce {
+		poolDone := make(chan struct{})
+		defer close(poolDone)
+		go func() {
+			select {
+			case <-r.jobCgroup.Tainted():
+				r.StopGracefully()
+			case <-poolDone:
+			}
+		}()
+	}
 
 	// Number of receives = number of sends
 	errs := make([]error, 0, len(r.workers))

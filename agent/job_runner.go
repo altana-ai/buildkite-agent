@@ -20,6 +20,8 @@ import (
 	"github.com/buildkite/agent/v3/core"
 	envutil "github.com/buildkite/agent/v3/env"
 	"github.com/buildkite/agent/v3/internal/experiments"
+	"github.com/buildkite/agent/v3/internal/jobcgroup"
+	"github.com/buildkite/agent/v3/internal/jobcontainers"
 	"github.com/buildkite/agent/v3/internal/process"
 	"github.com/buildkite/agent/v3/internal/shell"
 	"github.com/buildkite/agent/v3/kubernetes"
@@ -57,6 +59,9 @@ const (
 type JobRunnerConfig struct {
 	// The configuration of the agent from the CLI
 	AgentConfiguration AgentConfiguration
+
+	// The name the agent worker running the job registered with
+	AgentName string
 
 	// How often to check if the job has been cancelled
 	JobStatusInterval time.Duration
@@ -158,6 +163,17 @@ type JobRunner struct {
 	// bootstrap environment because it did not match --allowed-repositories.
 	// createEnvironment runs before jobLogs exists, so Run emits the warning.
 	droppedRemoteMirrorURL string
+	// jobCgroup is the job's cgroup, or nil if the job runs outside one.
+	jobCgroup *jobcgroup.Group
+
+	// containerSnapshot is the host's Docker state before the bootstrap
+	// started, or nil if Docker was not reached.
+	containerSnapshot *jobcontainers.Snapshot
+
+	// postExitLogs reaches every destination of jobLogs except the pipes
+	// that close when the bootstrap exits, at which point io.MultiWriter
+	// would drop every write to jobLogs at the first closed one.
+	postExitLogs io.Writer
 }
 
 // jobProcess is either a *process.Process, or a *kubernetes.Runner.
@@ -333,12 +349,16 @@ func NewJobRunner(ctx context.Context, l logger.Logger, apiClient *api.Client, c
 		}()
 	}
 
+	postExitWriters := []io.Writer{outputWriter}
 	if conf.AgentConfiguration.WriteJobLogsToStdout {
-		allWriters = append(allWriters, NewJobLogger(conf))
+		jobLogger := NewJobLogger(conf)
+		allWriters = append(allWriters, jobLogger)
+		postExitWriters = append(postExitWriters, jobLogger)
 	}
 
 	// The writer that output from the process goes into
 	r.jobLogs = io.MultiWriter(allWriters...)
+	r.postExitLogs = io.MultiWriter(postExitWriters...)
 
 	// Copy the current processes ENV and merge in the new ones. We do this
 	// so the sub process gets PATH and stuff. We merge our path in over
@@ -380,7 +400,7 @@ func NewJobRunner(ctx context.Context, l logger.Logger, apiClient *api.Client, c
 			cancelSignal = process.SIGTERM
 		}
 
-		r.process = process.New(r.agentLogger, process.Config{
+		procConf := process.Config{
 			Path:              cmd[0],
 			Args:              cmd[1:],
 			Dir:               conf.AgentConfiguration.BuildPath,
@@ -390,7 +410,23 @@ func NewJobRunner(ctx context.Context, l logger.Logger, apiClient *api.Client, c
 			Stderr:            r.jobLogs,
 			InterruptSignal:   cancelSignal,
 			SignalGracePeriod: conf.AgentConfiguration.SignalGracePeriod,
-		})
+		}
+		if m := conf.AgentConfiguration.JobCgroup; m != nil {
+			g, err := m.Create(conf.Job.ID)
+			if err != nil {
+				r.agentLogger.Warnf("[JobRunner] Job %s will run outside a job cgroup: %v", conf.Job.ID, err)
+				// Nothing will kill what this job leaves behind, so enforce
+				// mode takes no more jobs after it.
+				if m.Mode() == jobcgroup.ModeEnforce {
+					m.Taint()
+				}
+			} else {
+				r.jobCgroup = g
+				procConf.UseCgroupFD = true
+				procConf.CgroupFD = g.FD()
+			}
+		}
+		r.process = process.New(r.agentLogger, procConf)
 	}
 
 	// Close the writer end of the pipe when the process finishes
@@ -666,20 +702,21 @@ BUILDKITE_AGENT_JWKS_KEY_ID`
 	setEnv("BUILDKITE_ADDITIONAL_HOOKS_PATHS", strings.Join(r.conf.AgentConfiguration.AdditionalHooksPaths, ","))
 	setEnv("BUILDKITE_PLUGINS_PATH", r.conf.AgentConfiguration.PluginsPath)
 	setEnv("BUILDKITE_SSH_KEYSCAN", fmt.Sprint(r.conf.AgentConfiguration.SSHKeyscan))
-	// submodules/skip-checkout/skip-fetch/timeout are each emitted by the agent on
-	// only one side of their default (submodules off, skip-checkout on, skip-fetch
-	// on, timeout > 0); on the other, silent, side the agent stays quiet and
+	// submodules/skip-checkout/skip-fetch/fetch-base-branch/timeout are each emitted
+	// by the agent on only one side of their default (submodules off, skip-checkout
+	// on, skip-fetch on, fetch-base-branch on, timeout > 0); on the other, silent, side the agent stays quiet and
 	// historically let pipeline/step env decide. Only strict closes that silent
 	// side, emitting the agent value unconditionally so a job can't reintroduce a
 	// setting the agent left at its default. from-job and none keep the historical
 	// conditional emit; setCheckoutEnv then decides precedence against backend job
 	// env: from-job keeps agent config authoritative on the emitted side, none lets
 	// job env win. The checkout flags above are agent-authoritative in both from-job
-	// and strict (they were always emitted), so only these four differ by mode here.
+	// and strict (they were always emitted), so only these five differ by mode here.
 	if checkoutMode == envutil.CheckoutOverrideStrict {
 		setEnv("BUILDKITE_GIT_SUBMODULES", fmt.Sprint(r.conf.AgentConfiguration.GitSubmodules))
 		setEnv("BUILDKITE_SKIP_CHECKOUT", fmt.Sprint(r.conf.AgentConfiguration.SkipCheckout))
 		setEnv("BUILDKITE_GIT_SKIP_FETCH_EXISTING_COMMITS", fmt.Sprint(r.conf.AgentConfiguration.GitSkipFetchExistingCommits))
+		setEnv("BUILDKITE_GIT_FETCH_BASE_BRANCH", fmt.Sprint(r.conf.AgentConfiguration.GitFetchBaseBranch))
 		// A zero timeout means no checkout timeout; emit it anyway under strict so
 		// a job-supplied value can't reintroduce one past the agent config.
 		setEnv("BUILDKITE_GIT_CHECKOUT_TIMEOUT", strconv.Itoa(r.conf.AgentConfiguration.GitCheckoutTimeout))
@@ -697,6 +734,9 @@ BUILDKITE_AGENT_JWKS_KEY_ID`
 		}
 		if r.conf.AgentConfiguration.GitSkipFetchExistingCommits {
 			setCheckoutEnv("BUILDKITE_GIT_SKIP_FETCH_EXISTING_COMMITS", "true")
+		}
+		if r.conf.AgentConfiguration.GitFetchBaseBranch {
+			setCheckoutEnv("BUILDKITE_GIT_FETCH_BASE_BRANCH", "true")
 		}
 		if r.conf.AgentConfiguration.GitCheckoutTimeout > 0 {
 			setCheckoutEnv("BUILDKITE_GIT_CHECKOUT_TIMEOUT", strconv.Itoa(r.conf.AgentConfiguration.GitCheckoutTimeout))
