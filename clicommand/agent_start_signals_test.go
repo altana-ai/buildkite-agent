@@ -36,9 +36,13 @@ func TestPoolSignals_ExitingImmediatelyRunsBeforeExitFirst(t *testing.T) {
 
 			// Both paths can exit, so each records every call it makes.
 			calls := make(chan string, 8)
+			pool, err := agent.NewAgentPool(nil, &agent.AgentConfiguration{})
+			if err != nil {
+				t.Fatalf("agent.NewAgentPool() error = %v", err)
+			}
 			ps := &poolSignals{
 				log:        logger.Discard,
-				pool:       agent.NewAgentPool(nil, &agent.AgentConfiguration{}),
+				pool:       pool,
 				beforeExit: func() { calls <- "beforeExit" },
 				exit:       func(code int) { calls <- fmt.Sprintf("exit(%d)", code) },
 			}
