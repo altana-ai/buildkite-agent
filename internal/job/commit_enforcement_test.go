@@ -1,6 +1,7 @@
 package job
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -59,8 +60,18 @@ func newEnforcementFixture(t *testing.T) *enforcementFixture {
 	return &enforcementFixture{repository: repository, mainCommit: mainCommit, featureCommit: featureCommit}
 }
 
+func shrinkEnforcedFetchBackoff(t *testing.T, budget time.Duration) {
+	t.Helper()
+	saved := enforcedFetchBackoff
+	enforcedFetchBackoff.base = time.Millisecond
+	enforcedFetchBackoff.max = 4 * time.Millisecond
+	enforcedFetchBackoff.budget = budget
+	t.Cleanup(func() { enforcedFetchBackoff = saved })
+}
+
 func newEnforcementExecutor(t *testing.T, conf ExecutorConfig) *Executor {
 	t.Helper()
+	shrinkEnforcedFetchBackoff(t, time.Second)
 
 	conf.EnforceGitCommitVerification = true
 	conf.BuildPath = t.TempDir()
@@ -104,7 +115,7 @@ func TestEnforceCommitVerification(t *testing.T) {
 			name:            "branch missing from the repository",
 			branch:          "deleted-branch",
 			commit:          f.mainCommit,
-			wantErrContains: "couldn't fetch refs/heads/deleted-branch",
+			wantErrContains: "the repository has no refs/heads/deleted-branch",
 		},
 		{
 			name:            "commit given as a ref name",
@@ -159,6 +170,75 @@ func TestEnforceCommitVerification(t *testing.T) {
 				t.Errorf("e.enforceCommitVerification(ctx) = %q, want it to contain %q", err, tt.wantErrContains)
 			}
 		})
+	}
+}
+
+func TestFetchWithBackoff(t *testing.T) {
+	errFlaky := errors.New("remote end hung up unexpectedly")
+
+	for _, tt := range []struct {
+		name         string
+		budget       time.Duration
+		failures     int
+		missingRef   bool
+		wantErr      string
+		wantAttempts int
+	}{
+		{name: "succeeds first time", budget: time.Second, wantAttempts: 1},
+		{name: "rides out a flaky remote", budget: time.Second, failures: 5, wantAttempts: 6},
+		{name: "gives up when the budget runs out", budget: 20 * time.Millisecond, failures: 1 << 30, wantErr: "still failing after retrying"},
+		{name: "stops early on a ref the remote lacks", budget: time.Second, failures: 1 << 30, missingRef: true, wantErr: "the repository has no refs/heads/gone", wantAttempts: 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			shrinkEnforcedFetchBackoff(t, tt.budget)
+			e := New(ExecutorConfig{})
+			e.shell = shell.NewTestShell(t)
+
+			attempts := 0
+			err := e.fetchWithBackoff(t.Context(), "refs/heads/gone", func(smells map[string]bool) error {
+				attempts++
+				if attempts > tt.failures {
+					return nil
+				}
+				if tt.missingRef {
+					smells[gitErrStrBadReference] = true
+				}
+				return errFlaky
+			})
+
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("e.fetchWithBackoff(...) = %v, want nil", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantErr) || !errors.Is(err, errFlaky) {
+				t.Fatalf("e.fetchWithBackoff(...) = %v, want an error containing %q that wraps the fetch error", err, tt.wantErr)
+			}
+			if tt.wantAttempts != 0 && attempts != tt.wantAttempts {
+				t.Errorf("fetch attempts = %d, want %d", attempts, tt.wantAttempts)
+			}
+		})
+	}
+}
+
+func TestFetchWithBackoffStopsWhenCancelled(t *testing.T) {
+	shrinkEnforcedFetchBackoff(t, time.Hour)
+	e := New(ExecutorConfig{})
+	e.shell = shell.NewTestShell(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	attempts := 0
+	err := e.fetchWithBackoff(ctx, "refs/heads/main", func(map[string]bool) error {
+		attempts++
+		if attempts == 3 {
+			cancel()
+		}
+		return errors.New("connection reset")
+	})
+	if err == nil {
+		t.Fatal("e.fetchWithBackoff(cancelled ctx, ...) = nil, want an error")
+	}
+	if attempts != 3 {
+		t.Errorf("fetch attempts = %d, want 3 (none after the cancel)", attempts)
 	}
 }
 

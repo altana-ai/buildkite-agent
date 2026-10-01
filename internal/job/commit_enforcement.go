@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -111,12 +112,9 @@ func (e *Executor) verifyCommitReachableFrom(ctx context.Context, ref string) er
 	}
 
 	refspec := "+" + ref + ":" + enforcedVerificationTipRef
-	if err := roko.NewRetrier(
-		roko.WithMaxAttempts(3),
-		roko.WithStrategy(roko.Exponential(2*time.Second, 0)),
-		roko.WithJitter(),
-	).DoWithContext(ctx, func(*roko.Retrier) error {
-		return git("fetch", "--no-tags", "--no-write-fetch-head", "--filter=tree:0", "--", "origin", refspec).Run(ctx)
+	if err := e.fetchWithBackoff(ctx, ref, func(smells map[string]bool) error {
+		return git("fetch", "--no-tags", "--no-write-fetch-head", "--filter=tree:0", "--", "origin", refspec).
+			Run(ctx, shell.WithStringSearch(smells))
 	}); err != nil {
 		return fmt.Errorf("couldn't fetch %s from the repository: %w", ref, err)
 	}
@@ -143,6 +141,54 @@ func (e *Executor) verifyCommitReachableFrom(ctx context.Context, ref string) er
 	default:
 		return fmt.Errorf("couldn't check whether commit %s is on %s: %w", e.Commit, ref, err)
 	}
+}
+
+// enforcedFetchBackoff spreads retries over about ten minutes, so a job rides
+// out a GitHub incident rather than failing, and jitter keeps a fleet of
+// waiting agents from retrying in lockstep. Vars, not consts, so tests can
+// shrink them.
+var enforcedFetchBackoff = struct {
+	base, max, budget  time.Duration
+	missingRefAttempts int
+}{base: 2 * time.Second, max: time.Minute, budget: 10 * time.Minute, missingRefAttempts: 3}
+
+// fetchWithBackoff retries until the budget runs out, except that a ref the
+// remote says it lacks gets only a few attempts: that answer is nearly always
+// a deleted branch, which waiting won't bring back.
+func (e *Executor) fetchWithBackoff(ctx context.Context, ref string, fetch func(smells map[string]bool) error) error {
+	b := enforcedFetchBackoff
+	deadline := time.Now().Add(b.budget)
+	missingRef := 0
+	return roko.NewRetrier(
+		roko.TryForever(),
+		roko.WithStrategy(roko.Constant(b.base)),
+	).DoWithContext(ctx, func(r *roko.Retrier) error {
+		smells := map[string]bool{gitErrStrBadReference: false, gitErrStrBadReferencePreGit221: false}
+		err := fetch(smells)
+		if err == nil || ctx.Err() != nil {
+			if ctx.Err() != nil {
+				r.Break()
+			}
+			return err
+		}
+
+		step := min(b.max, b.base<<min(r.AttemptCount(), 30))
+		wait := step/2 + time.Duration(rand.Int64N(int64(step/2)+1))
+		if smells[gitErrStrBadReference] || smells[gitErrStrBadReferencePreGit221] {
+			missingRef++
+			if missingRef >= b.missingRefAttempts {
+				r.Break()
+				return fmt.Errorf("the repository has no %s: %w", ref, err)
+			}
+		}
+		if time.Now().Add(wait).After(deadline) {
+			r.Break()
+			return fmt.Errorf("still failing after retrying for %s: %w", b.budget, err)
+		}
+		r.SetNextInterval(wait)
+		e.shell.Warningf("Couldn't fetch %s to verify the commit (attempt %d), retrying in %s: %v", ref, r.AttemptCount()+1, wait.Round(time.Second), err)
+		return err
+	})
 }
 
 // borrowObjects keeps the fetch small on a host that already holds most of the
