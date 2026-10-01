@@ -266,6 +266,12 @@ var (
 		EnvVar: "BUILDKITE_GIT_COMMIT_VERIFICATION",
 	}
 
+	EnforceGitCommitVerificationFlag = cli.BoolFlag{
+		Name:   "enforce-git-commit-verification",
+		Usage:  "Fail every job, including one that skips checkout or uses a checkout hook, unless its commit is verified to be on its branch (or its tag, on a tag build). Jobs and hooks cannot turn this off",
+		EnvVar: "BUILDKITE_ENFORCE_GIT_COMMIT_VERIFICATION",
+	}
+
 	GitFetchFlagsFlag = cli.StringFlag{
 		Name:   "git-fetch-flags",
 		Value:  "-v --prune",

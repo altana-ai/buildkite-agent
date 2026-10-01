@@ -43,6 +43,10 @@ func (e *Executor) CheckoutPhase(ctx context.Context) (retErr error) {
 		}
 	}
 
+	if err := e.enforceCommitVerification(ctx); err != nil {
+		return err
+	}
+
 	// Remove the checkout directory if BUILDKITE_CLEAN_CHECKOUT is present
 	if e.CleanCheckout {
 		e.shell.Headerf("Cleaning pipeline checkout")

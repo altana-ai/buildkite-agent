@@ -164,26 +164,27 @@ type AgentStartConfig struct {
 	WaitForECSMetaDataTimeout string   `cli:"wait-for-ecs-meta-data-timeout"`
 	WaitForGCPLabelsTimeout   string   `cli:"wait-for-gcp-labels-timeout"`
 
-	GitCheckoutFlags            string   `cli:"git-checkout-flags"`
-	GitCloneFlags               string   `cli:"git-clone-flags"`
-	GitCloneMirrorFlags         string   `cli:"git-clone-mirror-flags"`
-	GitCleanFlags               string   `cli:"git-clean-flags"`
-	GitFetchFlags               string   `cli:"git-fetch-flags"`
-	GitSparseCheckoutPaths      []string `cli:"git-sparse-checkout-paths" normalize:"list"`
-	GitSparseCheckoutMode       string   `cli:"git-sparse-checkout-mode"`
-	GitMirrorsPath              string   `cli:"git-mirrors-path" normalize:"filepath"`
-	GitMirrorCheckoutMode       string   `cli:"git-mirror-checkout-mode"`
-	GitMirrorsLockTimeout       int      `cli:"git-mirrors-lock-timeout"`
-	GitMirrorsSkipUpdate        bool     `cli:"git-mirrors-skip-update"`
-	GitCheckoutTimeout          int      `cli:"git-checkout-timeout"`
-	GitCommitVerification       string   `cli:"git-commit-verification"`
-	NoGitSubmodules             bool     `cli:"no-git-submodules"`
-	GitSubmoduleCloneConfig     []string `cli:"git-submodule-clone-config"`
-	SkipCheckout                bool     `cli:"skip-checkout"`
-	GitSkipFetchExistingCommits bool     `cli:"git-skip-fetch-existing-commits"`
-	CheckoutOverrideMode        string   `cli:"checkout-override-mode"`
-	GitFetchBaseBranch          bool     `cli:"git-fetch-base-branch"`
-	CheckoutAttempts            int      `cli:"checkout-attempts"`
+	GitCheckoutFlags             string   `cli:"git-checkout-flags"`
+	GitCloneFlags                string   `cli:"git-clone-flags"`
+	GitCloneMirrorFlags          string   `cli:"git-clone-mirror-flags"`
+	GitCleanFlags                string   `cli:"git-clean-flags"`
+	GitFetchFlags                string   `cli:"git-fetch-flags"`
+	GitSparseCheckoutPaths       []string `cli:"git-sparse-checkout-paths" normalize:"list"`
+	GitSparseCheckoutMode        string   `cli:"git-sparse-checkout-mode"`
+	GitMirrorsPath               string   `cli:"git-mirrors-path" normalize:"filepath"`
+	GitMirrorCheckoutMode        string   `cli:"git-mirror-checkout-mode"`
+	GitMirrorsLockTimeout        int      `cli:"git-mirrors-lock-timeout"`
+	GitMirrorsSkipUpdate         bool     `cli:"git-mirrors-skip-update"`
+	GitCheckoutTimeout           int      `cli:"git-checkout-timeout"`
+	GitCommitVerification        string   `cli:"git-commit-verification"`
+	EnforceGitCommitVerification bool     `cli:"enforce-git-commit-verification"`
+	NoGitSubmodules              bool     `cli:"no-git-submodules"`
+	GitSubmoduleCloneConfig      []string `cli:"git-submodule-clone-config"`
+	SkipCheckout                 bool     `cli:"skip-checkout"`
+	GitSkipFetchExistingCommits  bool     `cli:"git-skip-fetch-existing-commits"`
+	CheckoutOverrideMode         string   `cli:"checkout-override-mode"`
+	GitFetchBaseBranch           bool     `cli:"git-fetch-base-branch"`
+	CheckoutAttempts             int      `cli:"checkout-attempts"`
 
 	NoSSHKeyscan            bool     `cli:"no-ssh-keyscan"`
 	NoCommandEval           bool     `cli:"no-command-eval"`
@@ -572,6 +573,7 @@ var AgentStartCommand = cli.Command{
 		GitCloneFlagsFlag,
 		GitCleanFlagsFlag,
 		GitCommitVerificationFlag,
+		EnforceGitCommitVerificationFlag,
 		GitFetchFlagsFlag,
 		GitSparseCheckoutPathsFlag,
 		GitSparseCheckoutModeFlag,
@@ -1166,6 +1168,7 @@ var AgentStartCommand = cli.Command{
 			GitCloneMirrorFlags:             cfg.GitCloneMirrorFlags,
 			GitCleanFlags:                   cfg.GitCleanFlags,
 			GitCommitVerification:           cfg.GitCommitVerification,
+			EnforceGitCommitVerification:    cfg.EnforceGitCommitVerification,
 			GitFetchFlags:                   cfg.GitFetchFlags,
 			GitSparseCheckoutPaths:          cfg.GitSparseCheckoutPaths,
 			GitSparseCheckoutMode:           sparseCheckoutMode,
