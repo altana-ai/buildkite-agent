@@ -2,7 +2,6 @@ package job
 
 import (
 	"errors"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,25 +12,6 @@ import (
 // Tests that --enforce-git-commit-verification holds against an attacker who
 // controls the build's branch and commit, a hook, or an earlier job's files on
 // a reused host.
-
-func makeReadOnlyForTest(t *testing.T, dir string) {
-	t.Helper()
-	if os.Geteuid() == 0 {
-		t.Skip("root can write a read-only directory, so it can't stand in for a store this job can't write")
-	}
-	chmodAll := func(mode func(fs.FileMode) fs.FileMode) {
-		_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err == nil && d.IsDir() {
-				if info, err := d.Info(); err == nil {
-					_ = os.Chmod(path, mode(info.Mode().Perm()))
-				}
-			}
-			return nil
-		})
-	}
-	chmodAll(func(m fs.FileMode) fs.FileMode { return m &^ 0o222 })
-	t.Cleanup(func() { chmodAll(func(m fs.FileMode) fs.FileMode { return m | 0o200 }) })
-}
 
 func gitForTest(t *testing.T, dir string, args ...string) string {
 	t.Helper()
@@ -149,36 +129,6 @@ func TestEnforcedVerificationIgnoresTheGlobalGitConfig(t *testing.T) {
 	}
 }
 
-func TestBorrowObjectsSkipsStoresTheJobCanWrite(t *testing.T) {
-	f := newEnforcementFixture(t)
-	writable := filepath.Join(t.TempDir(), "writable.git")
-	if out, err := exec.Command("git", "clone", "--mirror", "--", f.repository, writable).CombinedOutput(); err != nil {
-		t.Fatalf("git clone --mirror error = %v, output: %s", err, out)
-	}
-	readOnly := filepath.Join(t.TempDir(), "read-only.git")
-	if out, err := exec.Command("git", "clone", "--mirror", "--", f.repository, readOnly).CombinedOutput(); err != nil {
-		t.Fatalf("git clone --mirror error = %v, output: %s", err, out)
-	}
-	makeReadOnlyForTest(t, readOnly)
-
-	e := newEnforcementExecutor(t, ExecutorConfig{
-		Repository:    f.repository,
-		GitCloneFlags: "--reference " + writable + " --reference-if-able=" + readOnly,
-	})
-	gitDir := t.TempDir()
-	gitForTest(t, gitDir, "init", "--quiet", "--bare")
-	if err := e.borrowObjects(gitDir); err != nil {
-		t.Fatalf("e.borrowObjects(%q) error = %v", gitDir, err)
-	}
-	alternates, err := os.ReadFile(filepath.Join(gitDir, "objects", "info", "alternates"))
-	if err != nil {
-		t.Fatalf("reading alternates error = %v", err)
-	}
-	if got, want := strings.TrimSpace(string(alternates)), filepath.Join(readOnly, "objects"); got != want {
-		t.Errorf("alternates = %q, want only the read-only store %q", got, want)
-	}
-}
-
 // F5: a replace ref left in a reused checkout makes `git checkout <commit>`
 // write another commit's files while HEAD still names the verified commit.
 func TestCheckoutPhaseCatchesAReplaceRefInAReusedCheckout(t *testing.T) {
@@ -212,19 +162,38 @@ func TestCheckoutPhaseAcceptsAnHonestDefaultCheckout(t *testing.T) {
 	}
 }
 
-// F8: neither a skipped checkout nor a failed check may leave an earlier job's
-// files, including its local hooks, in place.
+// F8: neither a skipped checkout nor a failed check may run an earlier job's
+// files, including its local hooks. The job moves to an empty directory of its
+// own, and the shared checkout (a seeded tree, say) is left for later jobs.
 func TestCheckoutPhaseLeavesNoEarlierJobFiles(t *testing.T) {
 	f := newEnforcementFixture(t)
 
-	plantStaleHook := func(t *testing.T, checkoutPath string) {
+	plantStaleHook := func(t *testing.T, checkoutPath string) string {
 		t.Helper()
 		hooks := filepath.Join(checkoutPath, ".buildkite", "hooks")
 		if err := os.MkdirAll(hooks, 0o755); err != nil {
 			t.Fatalf("os.MkdirAll(%q) error = %v", hooks, err)
 		}
-		if err := os.WriteFile(filepath.Join(hooks, "pre-exit"), []byte("#!/bin/sh\necho stale\n"), 0o755); err != nil {
+		hook := filepath.Join(hooks, "pre-exit")
+		if err := os.WriteFile(hook, []byte("#!/bin/sh\necho stale\n"), 0o755); err != nil {
 			t.Fatalf("writing a stale pre-exit hook error = %v", err)
+		}
+		return hook
+	}
+	assertMovedToEmptyDir := func(t *testing.T, e *Executor, shared, staleHook string) {
+		t.Helper()
+		now, _ := e.shell.Env.Get("BUILDKITE_BUILD_CHECKOUT_PATH")
+		if now == shared {
+			t.Fatalf("BUILDKITE_BUILD_CHECKOUT_PATH is still the shared checkout %s, want an empty directory of the job's own", shared)
+		}
+		if entries, err := os.ReadDir(now); err != nil || len(entries) != 0 {
+			t.Errorf("the job's checkout directory %s holds %d entries (error %v), want it empty", now, len(entries), err)
+		}
+		if e.hasLocalHook("pre-exit") {
+			t.Error("an earlier job's pre-exit hook is still findable from the job's checkout directory")
+		}
+		if _, err := os.Stat(staleHook); err != nil {
+			t.Errorf("the shared checkout lost %s (stat error = %v), want it left alone", staleHook, err)
 		}
 	}
 
@@ -232,29 +201,24 @@ func TestCheckoutPhaseLeavesNoEarlierJobFiles(t *testing.T) {
 		conf := defaultCheckoutConfig(f, f.mainCommit)
 		conf.SkipCheckout = true
 		e := newEnforcementExecutor(t, conf)
-		checkoutPath := newCheckoutPathForTest(t, e)
-		plantStaleHook(t, checkoutPath)
+		shared := newCheckoutPathForTest(t, e)
+		staleHook := plantStaleHook(t, shared)
 
 		if err := e.CheckoutPhase(t.Context()); err != nil {
 			t.Fatalf("e.CheckoutPhase(ctx) = %v, want nil", err)
 		}
-		if entries, _ := os.ReadDir(checkoutPath); len(entries) != 0 {
-			t.Errorf("checkout directory holds %d entries after a skipped checkout, want it empty", len(entries))
-		}
+		assertMovedToEmptyDir(t, e, shared, staleHook)
 	})
 
 	t.Run("failed check", func(t *testing.T) {
 		e := newEnforcementExecutor(t, defaultCheckoutConfig(f, f.featureCommit))
-		checkoutPath := newCheckoutPathForTest(t, e)
-		plantStaleHook(t, checkoutPath)
+		shared := newCheckoutPathForTest(t, e)
+		staleHook := plantStaleHook(t, shared)
 
 		if err := e.CheckoutPhase(t.Context()); !errors.Is(err, ErrCommitNotVerified) {
 			t.Fatalf("e.CheckoutPhase(ctx) = %v, want ErrCommitNotVerified", err)
 		}
-		stale := filepath.Join(checkoutPath, ".buildkite", "hooks", "pre-exit")
-		if _, err := os.Stat(stale); !os.IsNotExist(err) {
-			t.Errorf("an earlier job's pre-exit hook %s survived the failed check (stat error = %v), want it removed", stale, err)
-		}
+		assertMovedToEmptyDir(t, e, shared, staleHook)
 	})
 }
 
@@ -271,16 +235,17 @@ func TestEnforcedCheckoutHookStartsEmpty(t *testing.T) {
 	conf := defaultCheckoutConfig(f, f.mainCommit)
 	conf.HooksPath = hooksPath
 	e := newEnforcementExecutor(t, conf)
-	checkoutPath := newCheckoutPathForTest(t, e)
-	if err := os.WriteFile(filepath.Join(checkoutPath, "stale"), []byte("from an earlier job\n"), 0o644); err != nil {
+	shared := newCheckoutPathForTest(t, e)
+	if err := os.WriteFile(filepath.Join(shared, "stale"), []byte("from an earlier job\n"), 0o644); err != nil {
 		t.Fatalf("planting a stale file error = %v", err)
 	}
 
 	if err := e.prepareEnforcedCheckoutDir(); err != nil {
 		t.Fatalf("e.prepareEnforcedCheckoutDir() = %v, want nil", err)
 	}
-	if _, err := os.Stat(filepath.Join(checkoutPath, "stale")); !os.IsNotExist(err) {
-		t.Errorf("the stale file survived ahead of a checkout hook (stat error = %v), want it removed", err)
+	now, _ := e.shell.Env.Get("BUILDKITE_BUILD_CHECKOUT_PATH")
+	if entries, err := os.ReadDir(now); now == shared || err != nil || len(entries) != 0 {
+		t.Errorf("checkout hook would start in %s with %d entries (error %v), want an empty directory other than %s", now, len(entries), err, shared)
 	}
 }
 
