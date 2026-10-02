@@ -31,6 +31,7 @@ type AgentConfiguration struct {
 	GitCloneMirrorFlags             string
 	GitCleanFlags                   string
 	GitCommitVerification           string
+	EnforceGitCommitVerification    bool
 	GitFetchFlags                   string
 	GitSparseCheckoutPaths          []string
 	GitSparseCheckoutMode           job.SparseCheckoutMode

@@ -139,6 +139,10 @@ type ExecutorConfig struct {
 	// Enable git commit verification
 	GitCommitVerification string `env:"BUILDKITE_GIT_COMMIT_VERIFICATION"`
 
+	// Fail the job unless its commit is verified on its branch or tag. Deliberately
+	// has no env tag, so no hook can turn it off by exporting the variable.
+	EnforceGitCommitVerification bool
+
 	// Config key=value pairs to pass to "git" when submodule init commands are invoked
 	GitSubmoduleCloneConfig []string `env:"BUILDKITE_GIT_SUBMODULE_CLONE_CONFIG"`
 

@@ -85,6 +85,7 @@ type BootstrapConfig struct {
 	GitCleanFlags                string   `cli:"git-clean-flags"`
 	GitSSHKey                    string   `cli:"git-ssh-key"`
 	GitCommitVerification        string   `cli:"git-commit-verification"`
+	EnforceGitCommitVerification bool     `cli:"enforce-git-commit-verification"`
 	GitRemoteMirrorURL           string   `cli:"git-remote-mirror-url"`
 	GitMirrorsPath               string   `cli:"git-mirrors-path" normalize:"filepath"`
 	GitMirrorCheckoutMode        string   `cli:"git-mirror-checkout-mode"`
@@ -267,6 +268,7 @@ var BootstrapCommand = cli.Command{
 		GitCloneMirrorFlagsFlag,
 		GitCleanFlagsFlag,
 		GitCommitVerificationFlag,
+		EnforceGitCommitVerificationFlag,
 		GitFetchFlagsFlag,
 		GitSparseCheckoutPathsFlag,
 		GitSparseCheckoutModeFlag,
@@ -507,6 +509,7 @@ var BootstrapCommand = cli.Command{
 			GitCheckoutFlags:             cfg.GitCheckoutFlags,
 			GitCleanFlags:                cfg.GitCleanFlags,
 			GitCommitVerification:        cfg.GitCommitVerification,
+			EnforceGitCommitVerification: cfg.EnforceGitCommitVerification,
 			GitCloneFlags:                cfg.GitCloneFlags,
 			GitCloneMirrorFlags:          cfg.GitCloneMirrorFlags,
 			GitFetchFlags:                cfg.GitFetchFlags,
