@@ -137,10 +137,17 @@ func TestEnforceCommitVerification(t *testing.T) {
 		},
 		{
 			name:            "commit not reachable from its tag",
-			branch:          "main",
+			branch:          "v1.0.0",
 			tag:             "v1.0.0",
 			commit:          strings.Repeat("ab", 20),
 			wantErrContains: "is not on refs/tags/v1.0.0",
+		},
+		{
+			name:            "tag vouching for a commit claimed as another branch",
+			branch:          "main",
+			tag:             "v1.0.0",
+			commit:          f.featureCommit,
+			wantErrContains: `claims branch "main"`,
 		},
 		{
 			name:            "branch missing from the repository",

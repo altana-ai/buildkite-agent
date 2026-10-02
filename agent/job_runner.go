@@ -546,6 +546,17 @@ func (r *JobRunner) createEnvironment(ctx context.Context) ([]string, error) {
 		setEnv(name, value)
 	}
 
+	// Enforced verification checks the commit with git, and so does the
+	// checkout, so neither may take git config or a repository from the job.
+	if r.conf.AgentConfiguration.EnforceGitCommitVerification {
+		for name := range env {
+			if envutil.IsGitRedirecting(name) {
+				delete(env, name)
+				ignoredEnv = append(ignoredEnv, name)
+			}
+		}
+	}
+
 	// Write out the job environment to file:
 	// - envShellFile: in k="v" format, with newlines escaped. If the
 	//   propagate-agent-vars experiment is enabled, the names of several agent
