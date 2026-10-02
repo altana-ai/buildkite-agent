@@ -29,71 +29,90 @@ const enforcedVerificationTipRef = "refs/commit-verification/tip"
 var hexObjectName = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
 
 // enforceCommitVerification runs before the checkout, a checkout hook, or a
-// skipped checkout, so no job that reaches its command escapes it.
+// skipped checkout, so no job that reaches its command escapes it. It pins
+// Commit to the full hash it verified, so the checkout can't resolve a short
+// hash or HEAD to something else.
 func (e *Executor) enforceCommitVerification(ctx context.Context) error {
 	if !e.EnforceGitCommitVerification {
 		return nil
 	}
-	if e.Commit == "HEAD" {
-		e.shell.Commentf("Commit verification: the commit is HEAD, so the job builds the tip of %q", e.Branch)
-		return nil
-	}
 
 	e.shell.Headerf("Verifying the commit is on its branch")
-	ref, err := e.enforcedVerificationRef()
-	if err == nil {
-		err = e.verifyCommitReachableFrom(ctx, ref)
-	}
+	commit, tree, ref, err := e.verifyEnforcedCommit(ctx)
 	if err != nil {
+		// A failed job still runs the checkout's pre-exit hook, which must not
+		// come from an earlier job's files.
+		e.discardCheckoutDir()
 		return fmt.Errorf("%w: %w", ErrCommitNotVerified, err)
 	}
-	e.shell.Commentf("Commit %s is on %s", e.Commit, ref)
+	e.verifiedCommit, e.verifiedTree = commit, tree
+	if e.Commit != commit {
+		e.shell.Commentf("Building %s, the commit %q resolves to on %s", commit, e.Commit, ref)
+		e.Commit = commit
+		e.shell.Env.Set("BUILDKITE_COMMIT", commit)
+	}
+	e.shell.Commentf("Commit %s is on %s", commit, ref)
 	return nil
 }
 
-// enforcedVerificationRef uses the backend's branch and tag, which no hook can
-// rewrite, so it verifies the build that was requested.
-func (e *Executor) enforcedVerificationRef() (string, error) {
+func (e *Executor) verifyEnforcedCommit(ctx context.Context) (commit, tree, ref string, err error) {
 	switch {
 	case e.Repository == "":
-		return "", errors.New("the job has no repository to verify its commit against")
-	case !hexObjectName.MatchString(e.Commit):
-		return "", fmt.Errorf("commit %q is not a commit hash", e.Commit)
+		return "", "", "", errors.New("the job has no repository to verify its commit against")
+	case e.Repository != e.canonicalRepository:
+		return "", "", "", fmt.Errorf("a hook changed BUILDKITE_REPO from %q to %q", e.canonicalRepository, e.Repository)
+	case e.Commit != "HEAD" && !hexObjectName.MatchString(e.Commit):
+		return "", "", "", fmt.Errorf("commit %q is not a commit hash", e.Commit)
+	}
+	switch branch := strings.TrimPrefix(e.Branch, "refs/heads/"); {
 	case e.Tag != "":
-		return "refs/tags/" + e.Tag, nil
+		ref = "refs/tags/" + e.Tag
+	case branch != "":
+		ref = "refs/heads/" + branch
+	default:
+		return "", "", "", errors.New("the job has no branch or tag to verify its commit against")
 	}
-	branch := strings.TrimPrefix(e.Branch, "refs/heads/")
-	if branch == "" {
-		return "", errors.New("the job has no branch or tag to verify its commit against")
-	}
-	return "refs/heads/" + branch, nil
+	commit, tree, err = e.verifyCommitReachableFrom(ctx, ref)
+	return commit, tree, ref, err
 }
 
 // verifyCommitReachableFrom answers in a throwaway bare repository so that it
-// works without a checkout. It fetches only commits, borrowing objects from any
-// mirror or reference repository the checkout would also use.
-func (e *Executor) verifyCommitReachableFrom(ctx context.Context, ref string) error {
+// works without a checkout and trusts nothing an earlier job could have left
+// on the host. It returns the full commit hash and its tree.
+func (e *Executor) verifyCommitReachableFrom(ctx context.Context, ref string) (commit, tree string, err error) {
 	if err := e.shell.Command("git", "check-ref-format", ref).Run(ctx); err != nil {
-		return fmt.Errorf("%q is not a valid ref", ref)
+		return "", "", fmt.Errorf("%q is not a valid ref", ref)
 	}
 
 	gitDir, err := os.MkdirTemp(e.BuildPath, "commit-verification-")
 	if err != nil {
-		return fmt.Errorf("creating a repository to verify in: %w", err)
+		return "", "", fmt.Errorf("creating a repository to verify in: %w", err)
 	}
 	defer os.RemoveAll(gitDir) //nolint:errcheck // Best-effort cleanup of a temporary directory.
 
+	isolation := shell.WithExtraEnv(env.FromMap(map[string]string{
+		// The global config is job-writable on a reused host, and a planted
+		// url.insteadOf would point the fetch at another repository.
+		"GIT_CONFIG_GLOBAL":      os.DevNull,
+		"GIT_NO_REPLACE_OBJECTS": "1",
+		"GIT_GRAFT_FILE":         os.DevNull,
+		// Otherwise resolving a commit the fetch didn't bring asks the remote
+		// for it, and a commit that exists only off the branch would resolve.
+		"GIT_NO_LAZY_FETCH": "1",
+	}))
+	gitArgs := append([]string{"--git-dir", gitDir, "-c", "core.commitGraph=false"}, e.enforcedCredentialConfig(ctx)...)
 	git := func(args ...string) shell.Command {
-		return e.shell.Command("git", append([]string{"--git-dir", gitDir}, args...)...)
+		return e.shell.Command("git", append(append([]string{}, gitArgs...), args...)...)
 	}
-	if err := git("init", "--quiet", "--bare").Run(ctx); err != nil {
-		return fmt.Errorf("initialising a repository to verify in: %w", err)
+
+	if err := git("init", "--quiet", "--bare").Run(ctx, isolation); err != nil {
+		return "", "", fmt.Errorf("initialising a repository to verify in: %w", err)
 	}
 	if err := e.borrowObjects(gitDir); err != nil {
-		return err
+		return "", "", err
 	}
-	if err := git("remote", "add", "origin", e.Repository).Run(ctx); err != nil {
-		return fmt.Errorf("adding the repository as a remote: %w", err)
+	if err := git("remote", "add", "origin", e.Repository).Run(ctx, isolation); err != nil {
+		return "", "", fmt.Errorf("adding the repository as a remote: %w", err)
 	}
 
 	if e.SSHKeyscan && !e.skipRepositorySSHKeyscan {
@@ -101,7 +120,7 @@ func (e *Executor) verifyCommitReachableFrom(ctx context.Context, ref string) er
 	}
 	sshKeyPath, cleanupSSHKey, err := e.prepareGitSSHKey()
 	if err != nil {
-		return fmt.Errorf("preparing git ssh key: %w", err)
+		return "", "", fmt.Errorf("preparing git ssh key: %w", err)
 	}
 	if cleanupSSHKey != nil {
 		defer func() {
@@ -114,33 +133,52 @@ func (e *Executor) verifyCommitReachableFrom(ctx context.Context, ref string) er
 	refspec := "+" + ref + ":" + enforcedVerificationTipRef
 	if err := e.fetchWithBackoff(ctx, ref, func(smells map[string]bool) error {
 		return git("fetch", "--no-tags", "--no-write-fetch-head", "--filter=tree:0", "--", "origin", refspec).
-			Run(ctx, shell.WithStringSearch(smells))
+			Run(ctx, isolation, shell.WithStringSearch(smells))
 	}); err != nil {
-		return fmt.Errorf("couldn't fetch %s from the repository: %w", ref, err)
+		return "", "", fmt.Errorf("couldn't fetch %s from the repository: %w", ref, err)
 	}
 
-	// Without this, resolving a commit the fetch didn't bring asks the remote
-	// for it, and a commit that exists only off the branch would then resolve.
-	noLazyFetch := shell.WithExtraEnv(env.FromMap(map[string]string{"GIT_NO_LAZY_FETCH": "1"}))
-
-	tip, err := git("rev-parse", "--verify", "--quiet", enforcedVerificationTipRef+"^{commit}").RunAndCaptureStdout(ctx, noLazyFetch)
+	tip, err := git("rev-parse", "--verify", "--quiet", enforcedVerificationTipRef+"^{commit}").RunAndCaptureStdout(ctx, isolation)
 	if err != nil {
-		return fmt.Errorf("%s does not point at a commit", ref)
+		return "", "", fmt.Errorf("%s does not point at a commit", ref)
 	}
-	commit, err := git("rev-parse", "--verify", "--quiet", e.Commit+"^{commit}").RunAndCaptureStdout(ctx, noLazyFetch)
-	if err != nil {
-		return fmt.Errorf("commit %s is not in the history of %s", e.Commit, ref)
+	tip = strings.TrimSpace(tip)
+	if e.Commit == "HEAD" {
+		commit = tip
+	} else {
+		commit, err = git("rev-parse", "--verify", "--quiet", e.Commit+"^{commit}").RunAndCaptureStdout(ctx, isolation)
+		if err != nil {
+			return "", "", fmt.Errorf("commit %s is not in the history of %s", e.Commit, ref)
+		}
+		commit = strings.TrimSpace(commit)
 	}
 
-	err = git("merge-base", "--is-ancestor", strings.TrimSpace(commit), strings.TrimSpace(tip)).Run(ctx, noLazyFetch)
+	err = git("merge-base", "--is-ancestor", commit, tip).Run(ctx, isolation)
 	switch {
-	case err == nil:
-		return nil
 	case shell.IsExitError(err) && shell.ExitCode(err) == 1:
-		return fmt.Errorf("commit %s is not on %s", e.Commit, ref)
-	default:
-		return fmt.Errorf("couldn't check whether commit %s is on %s: %w", e.Commit, ref, err)
+		return "", "", fmt.Errorf("commit %s is not on %s", e.Commit, ref)
+	case err != nil:
+		return "", "", fmt.Errorf("couldn't check whether commit %s is on %s: %w", e.Commit, ref, err)
 	}
+
+	tree, err = git("rev-parse", "--verify", "--quiet", commit+"^{tree}").RunAndCaptureStdout(ctx, isolation)
+	if err != nil {
+		return "", "", fmt.Errorf("couldn't read the tree of commit %s: %w", commit, err)
+	}
+	return commit, strings.TrimSpace(tree), nil
+}
+
+// enforcedCredentialConfig recreates the agent's own credential setup, which
+// it writes to the global config that the verification ignores.
+func (e *Executor) enforcedCredentialConfig(ctx context.Context) []string {
+	if !e.useRepositoryProviderGitCredentials() {
+		return nil
+	}
+	args := []string{"-c", "credential.useHttpPath=true", "-c", "credential.helper=" + gitCredentialHelperCommand(ctx)}
+	if e.skipRepositorySSHKeyscan || e.shell.Env.GetString("BUILDKITE_USE_GITHUB_APP_GIT_CREDENTIALS", "") == "true" {
+		args = append(args, "-c", "url.https://github.com/.insteadOf=git@github.com:")
+	}
+	return args
 }
 
 // enforcedFetchBackoff spreads retries over about ten minutes, so a job rides
@@ -192,24 +230,29 @@ func (e *Executor) fetchWithBackoff(ctx context.Context, ref string, fetch func(
 }
 
 // borrowObjects keeps the fetch small on a host that already holds most of the
-// history, which is what makes verifying every job affordable.
+// history. It borrows only stores this job can't write: git doesn't re-hash an
+// object it reads, so a store an earlier job could write could hold a forged
+// commit or commit-graph that fakes ancestry.
 func (e *Executor) borrowObjects(gitDir string) error {
 	var sources []string
 	if e.GitMirrorsPath != "" {
 		sources = append(sources, filepath.Join(e.GitMirrorsPath, dirForRepository(e.Repository)))
 	}
 	sources = append(sources, referenceRepositories(e.GitCloneFlags)...)
-	if checkoutPath, ok := e.shell.Env.Get("BUILDKITE_BUILD_CHECKOUT_PATH"); ok && checkoutPath != "" {
-		sources = append(sources, checkoutPath)
-	}
 
 	var alternates []string
 	for _, source := range sources {
 		for _, objects := range []string{filepath.Join(source, "objects"), filepath.Join(source, ".git", "objects")} {
-			if info, err := os.Stat(objects); err == nil && info.IsDir() {
-				alternates = append(alternates, objects)
-				break
+			info, err := os.Stat(objects)
+			if err != nil || !info.IsDir() {
+				continue
 			}
+			if objectStoreIsWritable(objects) {
+				e.shell.Commentf("Not borrowing objects from %s: this job could have written to it", objects)
+			} else {
+				alternates = append(alternates, objects)
+			}
+			break
 		}
 	}
 	if len(alternates) == 0 {
@@ -220,6 +263,88 @@ func (e *Executor) borrowObjects(gitDir string) error {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	return nil
+}
+
+// objectStoreIsWritable reports whether this process can add a file anywhere
+// git would read objects, packs, alternates or a commit-graph from. Probing by
+// creating a file answers for every platform and every way a directory can be
+// writable.
+func objectStoreIsWritable(objects string) bool {
+	dirs := []string{objects}
+	entries, err := os.ReadDir(objects)
+	if err != nil {
+		return true
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			dirs = append(dirs, filepath.Join(objects, entry.Name()))
+		}
+	}
+	for _, dir := range dirs {
+		probe, err := os.CreateTemp(dir, ".commit-verification-probe-")
+		if err == nil {
+			probe.Close()           //nolint:errcheck // Only the create mattered.
+			os.Remove(probe.Name()) //nolint:errcheck // Best-effort cleanup.
+			return true
+		}
+	}
+	return false
+}
+
+// prepareEnforcedCheckoutDir empties the checkout directory when the job will
+// not run the default checkout, so neither the job nor the checkout's local
+// hooks can run an earlier job's files.
+func (e *Executor) prepareEnforcedCheckoutDir() error {
+	defaultCheckout := !e.SkipCheckout && !e.hasPluginHook("checkout") && !e.hasGlobalHook("checkout")
+	if !e.EnforceGitCommitVerification || defaultCheckout {
+		return nil
+	}
+	e.shell.Commentf("Emptying the checkout directory: this job doesn't run the default checkout")
+	return e.removeCheckoutDir()
+}
+
+// assertCheckoutIsVerifiedCommit catches a checkout hook that checked out
+// something else, and a reused .git whose replace refs, grafts or planted
+// commit and tree objects made the checkout produce different files.
+func (e *Executor) assertCheckoutIsVerifiedCommit(ctx context.Context) error {
+	if !e.EnforceGitCommitVerification || e.SkipCheckout {
+		return nil
+	}
+	err := e.checkoutMatchesVerifiedCommit(ctx)
+	if err != nil {
+		e.discardCheckoutDir()
+		return fmt.Errorf("%w: %w", ErrCommitNotVerified, err)
+	}
+	return nil
+}
+
+func (e *Executor) checkoutMatchesVerifiedCommit(ctx context.Context) error {
+	checkoutPath, _ := e.shell.Env.Get("BUILDKITE_BUILD_CHECKOUT_PATH")
+	if _, err := os.Stat(filepath.Join(checkoutPath, ".git")); err != nil {
+		entries, readErr := os.ReadDir(checkoutPath)
+		if readErr == nil && len(entries) == 0 {
+			return nil
+		}
+		return fmt.Errorf("the checkout left files in %s that aren't a git checkout of %s", checkoutPath, e.verifiedCommit)
+	}
+
+	head, err := e.shell.Command("git", "-C", checkoutPath, "rev-parse", "--verify", "--quiet", "HEAD").RunAndCaptureStdout(ctx)
+	if err != nil || strings.TrimSpace(head) != e.verifiedCommit {
+		return fmt.Errorf("the checkout is at %q, not the verified commit %s", strings.TrimSpace(head), e.verifiedCommit)
+	}
+	// write-tree hashes the index from its entries, so it reflects what was
+	// actually checked out, whatever the object store claims.
+	tree, err := e.shell.Command("git", "-C", checkoutPath, "write-tree").RunAndCaptureStdout(ctx)
+	if err != nil || strings.TrimSpace(tree) != e.verifiedTree {
+		return fmt.Errorf("the checked-out files are tree %q, not the verified commit's tree %s", strings.TrimSpace(tree), e.verifiedTree)
+	}
+	return nil
+}
+
+func (e *Executor) discardCheckoutDir() {
+	if err := e.removeCheckoutDir(); err != nil {
+		e.shell.Warningf("Couldn't remove the checkout directory after commit verification failed: %v", err)
+	}
 }
 
 // referenceRepositories returns the --reference and --reference-if-able paths

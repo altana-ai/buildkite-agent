@@ -58,6 +58,10 @@ type Executor struct {
 	// still match.
 	canonicalRepository string
 
+	// The full commit hash and tree --enforce-git-commit-verification
+	// verified, which the checkout must then match.
+	verifiedCommit, verifiedTree string
+
 	// The checkout directory root
 	checkoutRoot *os.Root
 

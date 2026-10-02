@@ -20,9 +20,18 @@ import (
 // commit is reachable from its branch (or tag), even without a checkout.
 
 type enforcementFixture struct {
+	server        *githttptest.Server
+	repoName      string
 	repository    string
 	mainCommit    string
 	featureCommit string
+}
+
+func (f *enforcementFixture) createRef(t *testing.T, ref, commit string) {
+	t.Helper()
+	if out, err := f.server.CreateRef(f.repoName, ref, commit); err != nil {
+		t.Fatalf("CreateRef(%q, %q) error = %v, output: %s", f.repoName, ref, err, out)
+	}
 }
 
 func newEnforcementFixture(t *testing.T) *enforcementFixture {
@@ -57,7 +66,7 @@ func newEnforcementFixture(t *testing.T) *enforcementFixture {
 	}
 	mainCommit, _, _ := strings.Cut(string(lsRemote), "\t")
 
-	return &enforcementFixture{repository: repository, mainCommit: mainCommit, featureCommit: featureCommit}
+	return &enforcementFixture{server: s, repoName: repoName, repository: repository, mainCommit: mainCommit, featureCommit: featureCommit}
 }
 
 func shrinkEnforcedFetchBackoff(t *testing.T, budget time.Duration) {
@@ -260,6 +269,7 @@ func TestEnforceCommitVerificationBorrowedObjectsDoNotVerify(t *testing.T) {
 	if out, err := exec.Command("git", "clone", "--mirror", "--", f.repository, mirror).CombinedOutput(); err != nil {
 		t.Fatalf("git clone --mirror error = %v, output: %s", err, out)
 	}
+	makeReadOnlyForTest(t, mirror)
 
 	for _, tt := range []struct {
 		name    string

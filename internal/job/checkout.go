@@ -54,6 +54,9 @@ func (e *Executor) CheckoutPhase(ctx context.Context) (retErr error) {
 			return err
 		}
 	}
+	if err := e.prepareEnforcedCheckoutDir(); err != nil {
+		return err
+	}
 
 	e.shell.Headerf("Preparing working directory")
 
@@ -75,6 +78,9 @@ func (e *Executor) CheckoutPhase(ctx context.Context) (retErr error) {
 	}
 
 	if err := e.checkout(ctx); err != nil {
+		return err
+	}
+	if err := e.assertCheckoutIsVerifiedCommit(ctx); err != nil {
 		return err
 	}
 
