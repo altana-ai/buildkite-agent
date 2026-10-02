@@ -4,15 +4,13 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/buildkite/agent/v3/env"
-	"github.com/buildkite/agent/v3/internal/job/githttptest"
 	"github.com/buildkite/agent/v3/internal/shell"
 )
 
@@ -20,20 +18,29 @@ import (
 // commit is reachable from its branch (or tag), even without a checkout.
 
 type enforcementFixture struct {
-	server        *githttptest.Server
-	repoName      string
+	origin        string
 	repository    string
 	mainCommit    string
 	featureCommit string
+	// deepCommit is on main beyond the first shallow fetch, so finding it
+	// needs a deepen.
+	deepCommit string
 }
+
+// mainHistoryLength is more than the 64 commits of the first shallow fetch.
+const mainHistoryLength = 100
 
 func (f *enforcementFixture) createRef(t *testing.T, ref, commit string) {
 	t.Helper()
-	if out, err := f.server.CreateRef(f.repoName, ref, commit); err != nil {
-		t.Fatalf("CreateRef(%q, %q) error = %v, output: %s", f.repoName, ref, err, out)
-	}
+	gitForTest(t, f.origin, "update-ref", ref, commit)
 }
 
+// newEnforcementFixture serves a bare repository over file://. Like GitHub it
+// honours the commits-only filter and deepening fetches, which githttptest's
+// minimal upload-pack can't negotiate.
+//
+//	main:    100 commits; deepCommit is 90 back from the tip
+//	feature: main plus one commit, also tagged v1.0.0
 func newEnforcementFixture(t *testing.T) *enforcementFixture {
 	t.Helper()
 
@@ -42,31 +49,45 @@ func newEnforcementFixture(t *testing.T) *enforcementFixture {
 	t.Setenv("GIT_COMMITTER_NAME", "Buildkite Agent")
 	t.Setenv("GIT_COMMITTER_EMAIL", "agent@example.com")
 
-	const repoName = "enforcement"
-	s := githttptest.NewServer()
-	t.Cleanup(s.Close)
-	if err := s.CreateRepository(repoName); err != nil {
-		t.Fatalf("s.CreateRepository(%q) error = %v", repoName, err)
-	}
-	if out, err := s.InitRepository(repoName); err != nil {
-		t.Fatalf("s.InitRepository(%q) error = %v, output: %s", repoName, err, out)
-	}
-	featureCommit, out, err := s.PushBranch(repoName, "feature")
-	if err != nil {
-		t.Fatalf("s.PushBranch(%q, feature) error = %v, output: %s", repoName, err, out)
-	}
-	if out, err := s.CreateRef(repoName, "refs/tags/v1.0.0", featureCommit); err != nil {
-		t.Fatalf("s.CreateRef(%q, refs/tags/v1.0.0) error = %v, output: %s", repoName, err, out)
-	}
+	origin := filepath.Join(t.TempDir(), "enforcement.git")
+	gitForTest(t, filepath.Dir(origin), "init", "--quiet", "--bare", "--initial-branch=main", origin)
+	gitForTest(t, origin, "config", "uploadpack.allowFilter", "true")
+	repository := "file://" + filepath.ToSlash(origin)
 
-	repository := s.RepoURL(repoName)
-	lsRemote, err := exec.Command("git", "ls-remote", repository, "refs/heads/main").Output()
+	clone, err := os.MkdirTemp("", "enforcement-work-")
 	if err != nil {
-		t.Fatalf("git ls-remote %q refs/heads/main error = %v", repository, err)
+		t.Fatalf("os.MkdirTemp(enforcement-work-) error = %v", err)
 	}
-	mainCommit, _, _ := strings.Cut(string(lsRemote), "\t")
+	t.Cleanup(func() { os.RemoveAll(clone) }) //nolint:errcheck // Best-effort cleanup.
+	gitForTest(t, clone, "init", "--quiet", "--initial-branch=main")
+	// A burst of commits otherwise starts a background repack that races the reads below.
+	gitForTest(t, clone, "config", "gc.auto", "0")
+	gitForTest(t, clone, "config", "maintenance.auto", "false")
+	for i := range mainHistoryLength {
+		if err := os.WriteFile(filepath.Join(clone, "counter"), []byte(strconv.Itoa(i)), 0o644); err != nil {
+			t.Fatalf("writing counter error = %v", err)
+		}
+		gitForTest(t, clone, "add", "counter")
+		gitForTest(t, clone, "commit", "--quiet", "-m", "commit "+strconv.Itoa(i))
+	}
+	f := &enforcementFixture{
+		origin:     origin,
+		repository: repository,
+		mainCommit: gitForTest(t, clone, "rev-parse", "HEAD"),
+		deepCommit: gitForTest(t, clone, "rev-parse", "HEAD~90"),
+	}
+	gitForTest(t, clone, "push", "--quiet", repository, "HEAD:refs/heads/main")
 
-	return &enforcementFixture{server: s, repoName: repoName, repository: repository, mainCommit: mainCommit, featureCommit: featureCommit}
+	gitForTest(t, clone, "switch", "--quiet", "--create", "feature")
+	if err := os.WriteFile(filepath.Join(clone, "feature"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatalf("writing feature error = %v", err)
+	}
+	gitForTest(t, clone, "add", "feature")
+	gitForTest(t, clone, "commit", "--quiet", "-m", "feature")
+	f.featureCommit = gitForTest(t, clone, "rev-parse", "HEAD")
+	gitForTest(t, clone, "push", "--quiet", repository, "HEAD:refs/heads/feature")
+	f.createRef(t, "refs/tags/v1.0.0", f.featureCommit)
+	return f
 }
 
 func shrinkEnforcedFetchBackoff(t *testing.T, budget time.Duration) {
@@ -107,18 +128,19 @@ func TestEnforceCommitVerification(t *testing.T) {
 		{name: "commit at its tag", branch: "v1.0.0", tag: "v1.0.0", commit: f.featureCommit},
 		{name: "abbreviated commit", branch: "main", commit: f.mainCommit[:12]},
 		{name: "HEAD builds the branch tip", branch: "main", commit: "HEAD"},
+		{name: "commit beyond the first shallow fetch", branch: "main", commit: f.deepCommit},
 		{
 			name:            "commit only on another branch",
 			branch:          "main",
 			commit:          f.featureCommit,
-			wantErrContains: "is not in the history of refs/heads/main",
+			wantErrContains: "is not on refs/heads/main",
 		},
 		{
 			name:            "commit not reachable from its tag",
 			branch:          "main",
 			tag:             "v1.0.0",
 			commit:          strings.Repeat("ab", 20),
-			wantErrContains: "is not in the history of refs/tags/v1.0.0",
+			wantErrContains: "is not on refs/tags/v1.0.0",
 		},
 		{
 			name:            "branch missing from the repository",
@@ -259,44 +281,6 @@ func TestEnforceCommitVerificationOffDoesNothing(t *testing.T) {
 	}
 }
 
-// A commit present in a borrowed object store but off the branch must still
-// fail: borrowing objects must not stand in for reachability.
-func TestEnforceCommitVerificationBorrowedObjectsDoNotVerify(t *testing.T) {
-	f := newEnforcementFixture(t)
-
-	mirrors := t.TempDir()
-	mirror := filepath.Join(mirrors, dirForRepository(f.repository))
-	if out, err := exec.Command("git", "clone", "--mirror", "--", f.repository, mirror).CombinedOutput(); err != nil {
-		t.Fatalf("git clone --mirror error = %v, output: %s", err, out)
-	}
-	makeReadOnlyForTest(t, mirror)
-
-	for _, tt := range []struct {
-		name    string
-		commit  string
-		wantErr bool
-	}{
-		{name: "on the branch", commit: f.mainCommit},
-		{name: "off the branch but in the mirror", commit: f.featureCommit, wantErr: true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			e := newEnforcementExecutor(t, ExecutorConfig{
-				Repository:     f.repository,
-				Branch:         "main",
-				Commit:         tt.commit,
-				GitMirrorsPath: mirrors,
-			})
-			err := e.enforceCommitVerification(t.Context())
-			if gotErr := err != nil; gotErr != tt.wantErr {
-				t.Fatalf("e.enforceCommitVerification(ctx) = %v, want error: %t", err, tt.wantErr)
-			}
-			if tt.wantErr && !strings.Contains(err.Error(), "is not on refs/heads/main") {
-				t.Errorf("e.enforceCommitVerification(ctx) = %q, want it to say the commit is not on refs/heads/main", err)
-			}
-		})
-	}
-}
-
 // A skipped checkout is one of the ways around --git-commit-verification, so the
 // enforced check has to run first.
 func TestCheckoutPhaseEnforcesBeforeSkippedCheckout(t *testing.T) {
@@ -335,13 +319,5 @@ func TestEnforceGitCommitVerificationIsLockedAgainstJobs(t *testing.T) {
 	}
 	if env.IsCheckoutOverrideScoped(name) {
 		t.Errorf("env.IsCheckoutOverrideScoped(%q) = true, want false so no checkout-override mode unlocks it", name)
-	}
-}
-
-func TestReferenceRepositories(t *testing.T) {
-	got := referenceRepositories(`-v --reference-if-able /opt/seed.git --dissociate --reference=/srv/other "--reference" "/path with space"`)
-	want := []string{"/opt/seed.git", "/srv/other", "/path with space"}
-	if !slices.Equal(got, want) {
-		t.Errorf("referenceRepositories(...) = %q, want %q", got, want)
 	}
 }
