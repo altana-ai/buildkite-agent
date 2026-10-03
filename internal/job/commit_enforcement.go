@@ -67,6 +67,11 @@ func (e *Executor) verifyEnforcedCommit(ctx context.Context) (commit, tree, ref 
 	}
 	switch branch := strings.TrimPrefix(e.Branch, "refs/heads/"); {
 	case e.Tag != "":
+		// A tag build's branch is its tag, so any other branch would let the tag
+		// vouch for a commit on a branch it says nothing about.
+		if branch != "" && branch != e.Tag {
+			return "", "", "", fmt.Errorf("the job is a build of tag %q but claims branch %q", e.Tag, e.Branch)
+		}
 		ref = "refs/tags/" + e.Tag
 	case branch != "":
 		ref = "refs/heads/" + branch
