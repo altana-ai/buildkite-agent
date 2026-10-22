@@ -23,6 +23,8 @@ import (
 	envutil "github.com/buildkite/agent/v4/env"
 	"github.com/buildkite/agent/v4/internal/experiments"
 	"github.com/buildkite/agent/v4/internal/job"
+	"github.com/buildkite/agent/v4/internal/jobcgroup"
+	"github.com/buildkite/agent/v4/internal/jobcontainers"
 	"github.com/buildkite/agent/v4/internal/process"
 	"github.com/buildkite/agent/v4/internal/shell"
 	"github.com/buildkite/agent/v4/kubernetes"
@@ -58,6 +60,9 @@ const (
 type JobRunnerConfig struct {
 	// The configuration of the agent from the CLI
 	AgentConfiguration AgentConfiguration
+
+	// The name the agent worker running the job registered with.
+	AgentName string
 
 	// How often to check if the job has been cancelled
 	JobStatusInterval time.Duration
@@ -174,6 +179,13 @@ type JobRunner struct {
 	// both match names as they were written. Everything else uses
 	// r.conf.Job.Env, which holds the names the OS will actually resolve.
 	signedJobEnv map[string]string
+
+	// jobCgroup is the job's cgroup, or nil if the job runs outside one.
+	jobCgroup *jobcgroup.Group
+
+	// containerSnapshot is the host's Docker state before the bootstrap
+	// started, or nil if Docker was not reached.
+	containerSnapshot *jobcontainers.Snapshot
 }
 
 // jobProcess is either a *process.Process, or a *kubernetes.Runner.
@@ -362,7 +374,7 @@ func NewJobRunner(ctx context.Context, l logger.Logger, apiClient *api.Client, c
 			cancelSignal = process.SIGTERM
 		}
 
-		r.process = process.New(r.agentLogger, process.Config{
+		procConf := process.Config{
 			Path:              cmd[0],
 			Args:              cmd[1:],
 			Dir:               conf.AgentConfiguration.BuildPath,
@@ -372,7 +384,23 @@ func NewJobRunner(ctx context.Context, l logger.Logger, apiClient *api.Client, c
 			Stderr:            r.jobLogs,
 			InterruptSignal:   cancelSignal,
 			SignalGracePeriod: conf.AgentConfiguration.CancelSignalTimeout,
-		})
+		}
+		if m := conf.AgentConfiguration.JobCgroup; m != nil {
+			g, err := m.Create(conf.Job.ID)
+			if err != nil {
+				r.agentLogger.Warnf("[JobRunner] Job %s will run outside a job cgroup: %v", conf.Job.ID, err)
+				// Nothing will kill what this job leaves behind, so enforce
+				// mode takes no more jobs after it.
+				if m.Mode() == jobcgroup.ModeEnforce {
+					m.Taint()
+				}
+			} else {
+				r.jobCgroup = g
+				procConf.UseCgroupFD = true
+				procConf.CgroupFD = g.FD()
+			}
+		}
+		r.process = process.New(r.agentLogger, procConf)
 	}
 
 	return r, nil

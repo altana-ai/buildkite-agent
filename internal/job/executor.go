@@ -1019,6 +1019,12 @@ func dirForAgentName(agentName string) string {
 	return badCharsRE.ReplaceAllString(agentName, "-")
 }
 
+// AgentBuildDir is the directory under buildPath that holds every checkout
+// made by the agent named agentName.
+func AgentBuildDir(buildPath, agentName string) string {
+	return filepath.Join(buildPath, dirForAgentName(agentName))
+}
+
 func dirForRepository(repository string) string {
 	return badCharsRE.ReplaceAllString(repository, "-")
 }
@@ -1044,7 +1050,7 @@ func (e *Executor) setUp(ctx context.Context) (retErr error) {
 			return fmt.Errorf("must set either a BUILDKITE_BUILD_PATH or a BUILDKITE_BUILD_CHECKOUT_PATH")
 		}
 		e.shell.Env.Set("BUILDKITE_BUILD_CHECKOUT_PATH",
-			filepath.Join(e.BuildPath, dirForAgentName(e.AgentName), e.OrganizationSlug, e.PipelineSlug))
+			filepath.Join(AgentBuildDir(e.BuildPath, e.AgentName), e.OrganizationSlug, e.PipelineSlug))
 	}
 
 	// The job runner sets BUILDKITE_IGNORED_ENV with any keys that were ignored
